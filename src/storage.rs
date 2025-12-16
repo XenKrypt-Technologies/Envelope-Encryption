@@ -14,6 +14,7 @@ pub struct KeyMetadata {
     pub created_at: DateTime<Utc>,
     pub is_active: bool,
     pub parent_key_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,  // User ID for per-user KEKs
     pub cid: Option<Uuid>,
 }
 
@@ -26,6 +27,7 @@ impl KeyMetadata {
             created_at: Utc::now(),
             is_active: true,
             parent_key_id: None,
+            user_id: None,
             cid: None,
         }
     }
@@ -33,13 +35,15 @@ impl KeyMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum KeyType {
-    KEK,
-    DEK,
+    ServerKey,  // Renamed from MasterKey - for DB and system security
+    KEK,        // Per-user Key Encryption Key
+    DEK,        // One-time Data Encryption Key
 }
 
 impl std::fmt::Display for KeyType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            KeyType::ServerKey => write!(f, "ServerKey"),
             KeyType::KEK => write!(f, "KEK"),
             KeyType::DEK => write!(f, "DEK"),
         }
@@ -67,6 +71,8 @@ pub trait KeyStorage: Send + Sync {
     fn get_key(&self, key_id: &Uuid) -> Result<Option<StoredKey>>;
     fn get_keys_by_type(&self, key_type: &KeyType) -> Result<Vec<StoredKey>>;
     fn get_key_by_cid(&self, cid: &Uuid) -> Result<Option<StoredKey>>;
+    fn get_kek_by_user_id(&self, user_id: &Uuid) -> Result<Option<StoredKey>>;
+    fn get_active_server_key(&self) -> Result<Option<StoredKey>>;
     fn update_key_metadata(&self, key_id: &Uuid, metadata: KeyMetadata) -> Result<()>;
     fn delete_key(&self, key_id: &Uuid) -> Result<()>;
     fn list_key_ids(&self) -> Result<Vec<Uuid>>;
@@ -151,5 +157,21 @@ impl KeyStorage for InMemoryStorage {
     fn delete_record(&self, cid: &Uuid) -> Result<()> {
         self.records.write().remove(cid);
         Ok(())
+    }
+
+    fn get_kek_by_user_id(&self, user_id: &Uuid) -> Result<Option<StoredKey>> {
+        Ok(self.keys.read()
+            .values()
+            .find(|k| k.metadata.key_type == KeyType::KEK
+                   && k.metadata.user_id.as_ref() == Some(user_id)
+                   && k.metadata.is_active)
+            .cloned())
+    }
+
+    fn get_active_server_key(&self) -> Result<Option<StoredKey>> {
+        Ok(self.keys.read()
+            .values()
+            .find(|k| k.metadata.key_type == KeyType::ServerKey && k.metadata.is_active)
+            .cloned())
     }
 }

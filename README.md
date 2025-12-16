@@ -1,13 +1,13 @@
 # Envelope Encryption
 
-A Rust implementation of HSM-like envelope encryption with a hierarchical key management system.
+A Rust implementation of envelope encryption with per-user key encryption keys and manual key rotation.
 
 ## Overview
 
 Envelope encryption is a data protection strategy where:
-1. **Data Encryption Key (DEK)** - Encrypts the actual data
-2. **Key Encryption Key (KEK)** - Wraps/encrypts the DEK
-3. **Master Key (MK)** - Root of trust, protects all KEKs
+1. **Data Encryption Key (DEK)** - One-time key that encrypts the actual data
+2. **Key Encryption Key (KEK)** - Per-user master key that wraps/encrypts DEKs
+3. **Server Key** - Per-server root key that protects all KEKs for DB and system security
 
 This creates layers of protection and enables **key rotation without re-encrypting all data**.
 
@@ -15,16 +15,17 @@ This creates layers of protection and enables **key rotation without re-encrypti
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Master Key (MK)                          │
-│         Root of trust, protects all KEKs                   │
+│                    Server Key (SK)                          │
+│     Per-server key for DB and system security              │
 └─────────────────────────┬───────────────────────────────────┘
                           │
               ┌───────────┴───────────┐
               │                       │
               ▼                       ▼
 ┌─────────────────────┐   ┌─────────────────────┐
-│   KEK-1 (wrapped)   │   │   KEK-2 (wrapped)   │
-│  Key Encryption Key │   │  Key Encryption Key │
+│   KEK-1 (User 1)    │   │   KEK-2 (User 2)    │
+│  Encrypted by SK    │   │  Encrypted by SK    │
+│  (EKEK stored)      │   │  (EKEK stored)      │
 └──────────┬──────────┘   └──────────┬──────────┘
            │                         │
     ┌──────┴──────┐          ┌───────┴───────┐
@@ -32,7 +33,7 @@ This creates layers of protection and enables **key rotation without re-encrypti
     ▼             ▼          ▼               ▼
 ┌───────┐    ┌───────┐  ┌───────┐      ┌───────┐
 │ DEK-1 │    │ DEK-2 │  │ DEK-3 │      │ DEK-4 │
-│(wrap) │    │(wrap) │  │(wrap) │      │(wrap) │
+│(EDEK) │    │(EDEK) │  │(EDEK) │      │(EDEK) │
 └───┬───┘    └───┬───┘  └───┬───┘      └───┬───┘
     │            │          │              │
     ▼            ▼          ▼              ▼
@@ -45,27 +46,32 @@ This creates layers of protection and enables **key rotation without re-encrypti
 ## Features
 
 - **AES-256-GCM**: Industry-standard authenticated encryption
-- **HKDF-SHA256**: Modern key derivation (upgraded from simple HMAC-SHA256)
-- **Key Rotation**: Rotate Master Keys, KEKs, or DEKs independently
+- **No HKDF**: Pure envelope encryption without key derivation functions
+- **Per-User KEKs**: Each user has their own Key Encryption Key
+- **Manual Key Rotation**: Rotate Server Keys or per-user KEKs independently
+- **Version Tracking**: Both Server Keys and KEKs maintain version numbers
+- **One-Time DEKs**: DEKs are generated per encryption operation (no rotation needed)
 - **Pluggable Storage**: In-memory (included), PostgreSQL (planned)
 - **Zero-copy Security**: Keys are zeroized from memory when dropped
-- **Department Isolation**: Multiple KEKs for tenant/department separation
-- **Stateless Mode**: HKDF-derived DEKs for deterministic encryption
+- **User Isolation**: Each user's data is protected by their unique KEK
 
 ## Quick Start
 
 ```rust
 use envelope_encryption::{EnvelopeEncryption, InMemoryStorage};
 use std::sync::Arc;
+use uuid::Uuid;
 
 // Create storage and encryption service
 let storage = Arc::new(InMemoryStorage::new());
 let mut service = EnvelopeEncryption::new(storage).unwrap();
-service.initialize().unwrap();
 
-// Encrypt data
+// Create user ID
+let user_id = Uuid::new_v4();
+
+// Encrypt data for a user
 let plaintext = b"Secret message";
-let envelope = service.encrypt(plaintext, None, None).unwrap();
+let envelope = service.encrypt(plaintext, &user_id, None).unwrap();
 
 // Decrypt data
 let decrypted = service.decrypt(&envelope).unwrap();
@@ -74,60 +80,52 @@ assert_eq!(plaintext.to_vec(), decrypted);
 
 ## Key Rotation
 
-### Master Key Rotation
+### Server Key Rotation
 
-Automatically re-wraps all KEKs with the new master key:
+Automatically re-wraps all user KEKs with the new server key:
 
 ```rust
-let result = service.rotate_master_key().unwrap();
+let result = service.rotate_server_key().unwrap();
 println!("Rotated: v{} -> v{}", result.old_version, result.new_version);
 println!("KEKs re-wrapped: {}", result.keys_rewrapped);
 ```
 
-### KEK Rotation
+### User KEK Rotation
 
-Re-wraps all DEKs under the rotated KEK:
+Re-wraps all DEKs for a specific user under their new KEK:
 
 ```rust
-let result = service.rotate_kek(&kek_id).unwrap();
+let user_id = Uuid::new_v4();
+let result = service.rotate_user_kek(&user_id).unwrap();
 println!("DEKs re-wrapped: {}", result.keys_rewrapped);
 ```
 
-## Department Isolation
+### DEK Rotation
 
-Create separate KEKs for different departments/tenants:
+DEKs are one-time use keys generated for each encryption operation. They do not require rotation as they are unique per encryption.
 
-```rust
-let hr_kek = service.generate_kek().unwrap();
-let finance_kek = service.generate_kek().unwrap();
+## User Isolation
 
-// HR data uses HR KEK
-let hr_envelope = service.encrypt_with_kek(hr_data, &hr_kek, None, None).unwrap();
-
-// Finance data uses Finance KEK
-let finance_envelope = service.encrypt_with_kek(finance_data, &finance_kek, None, None).unwrap();
-```
-
-## Stateless Encryption (HKDF-derived DEKs)
-
-For scenarios where you don't want to store DEKs:
+Each user automatically gets their own KEK:
 
 ```rust
-let data_id = Uuid::new_v4();
+let user1_id = Uuid::new_v4();
+let user2_id = Uuid::new_v4();
 
-// DEK is derived from Master Key + Data ID using HKDF-SHA256
-let encrypted = service.encrypt_stateless(plaintext, &data_id).unwrap();
+// User 1's data - encrypted with User 1's KEK
+let user1_envelope = service.encrypt(user1_data, &user1_id, None).unwrap();
 
-// Same data_id will derive the same DEK
-let decrypted = service.decrypt_stateless(&encrypted, &data_id).unwrap();
+// User 2's data - encrypted with User 2's KEK
+let user2_envelope = service.encrypt(user2_data, &user2_id, None).unwrap();
+
+// Each user has a different KEK
+assert_ne!(user1_envelope.kek_id, user2_envelope.kek_id);
 ```
-
-This is the **upgraded approach** from the previous HMAC-SHA256 key derivation, using HKDF which is specifically designed for key derivation with proper extract-and-expand phases.
 
 ## Running the Demo
 
 ```bash
-cargo run --bin demo
+cargo run
 ```
 
 ## Running Tests
@@ -142,10 +140,18 @@ cargo test
 
 | Module | Description |
 |--------|-------------|
-| `crypto` | AES-256-GCM encryption, HKDF key derivation |
+| `crypto` | AES-256-GCM encryption |
 | `storage` | Storage trait and in-memory implementation |
-| `key_manager` | Key hierarchy management (MK, KEK, DEK) |
+| `key_manager` | Key hierarchy management (ServerKey, KEK, DEK) |
 | `envelope` | High-level envelope encryption API |
+
+### Key Types
+
+| Key Type | Purpose | Encrypted By | Rotation |
+|----------|---------|--------------|----------|
+| **ServerKey** | Per-server root key for DB and system security | Stored in HSM/KMS | Manual, re-wraps all KEKs |
+| **KEK** | Per-user master key (actual encryption key per user) | ServerKey (stored as EKEK) | Manual, re-wraps user's DEKs |
+| **DEK** | One-time data encryption key | User's KEK (stored as EDEK) | Not needed (one-time use) |
 
 ### Storage Backend
 
@@ -155,7 +161,8 @@ The `KeyStorage` trait allows for different storage backends:
 pub trait KeyStorage: Send + Sync {
     fn store_key(&self, stored_key: StoredKey) -> Result<()>;
     fn get_key(&self, key_id: &Uuid) -> Result<Option<StoredKey>>;
-    fn get_active_key(&self, key_type: &KeyType) -> Result<Option<StoredKey>>;
+    fn get_kek_by_user_id(&self, user_id: &Uuid) -> Result<Option<StoredKey>>;
+    fn get_active_server_key(&self) -> Result<Option<StoredKey>>;
     // ... more methods
 }
 ```
@@ -166,17 +173,53 @@ Currently implemented:
 Planned:
 - PostgreSQL storage (enable with `--features postgres`)
 
+## Key Derivation
+
+**Important**: This implementation does NOT use HKDF or any key derivation function. The architecture uses standard envelope encryption:
+
+1. **Encryption Flow**:
+   - Input: `user_id`, `plaintext`, optional `cid`
+   - Generate one-time DEK (random 256-bit key)
+   - Encrypt plaintext with DEK using AES-256-GCM (with `cid` as AAD)
+   - Get or create user's KEK (per `user_id`)
+   - Encrypt DEK with KEK to create EDEK (with `dek_id` as AAD)
+   - Store EDEK with nonce and tag
+   - Output: Encrypted data + EDEK metadata
+
+2. **Decryption Flow**:
+   - Input: `user_id`, EDEK (ciphertext + nonce + tag), `dek_id`
+   - Get user's KEK using `user_id`
+   - Decrypt EDEK using KEK to recover DEK (verifying `dek_id` as AAD)
+   - Decrypt data using DEK (verifying `cid` as AAD)
+   - Output: Plaintext
+
 ## Security Considerations
 
-1. **Master Key Protection**: In production, the master key should be stored in an HSM or secure enclave
+1. **Server Key Protection**: In production, the server key should be stored in an HSM or KMS
 2. **Key Zeroization**: All key material is automatically zeroized when dropped
-3. **AAD Binding**: Ciphertexts are bound to their data IDs using Additional Authenticated Data (AAD)
+3. **AAD Binding**:
+   - Data ciphertexts are bound to their `cid` using Additional Authenticated Data
+   - EDEKs are bound to their `dek_id`
+   - EKEKs are bound to their `user_id`
 4. **Unique Nonces**: Each encryption generates a fresh random nonce
+5. **User Isolation**: Each user's data can only be decrypted with their specific KEK
+
+## Version Tracking
+
+Both Server Keys and KEKs maintain version numbers:
+
+- **Server Key Version**: Increments on each server key rotation
+- **KEK Version**: Each user's KEK maintains its own version, increments on rotation
+- **DEK Version**: Always 1 (one-time use, no rotation)
+
+Example:
+```rust
+let stats = service.get_stats().unwrap();
+println!("Server Key Version: v{}", stats.server_key_version);
+println!("Active KEKs: {}", stats.active_keks);
+println!("One-time DEKs: {}", stats.total_deks);
+```
 
 ## License
 
 MIT
-
-
-
-

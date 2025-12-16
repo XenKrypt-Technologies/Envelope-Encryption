@@ -158,3 +158,4 @@ pub fn generate_random_bytes(len: usize) -> Vec<u8> {
     OsRng.fill_bytes(&mut bytes);
     bytes
 }
+
