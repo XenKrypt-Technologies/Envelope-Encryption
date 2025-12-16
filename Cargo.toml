@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "hsm"
 path = "src/main.rs"
 
+[features]
+default = ["postgres"]
+postgres = []
+
 [dependencies]
 aes-gcm = "0.10"
 rand = "0.8"

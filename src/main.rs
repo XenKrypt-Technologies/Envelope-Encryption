@@ -10,14 +10,14 @@
 ///   3. psql -U postgres -d envelope_encryption -f migrations/001_init_schema.sql
 ///   4. Create .env with DATABASE_URL and SERVER_KEY_BASE64 (openssl rand -base64 32)
 
-use envelope_encryption::{EnvelopeEncryption, InMemoryStorage, AesGcmCipher};
+use envelope_encryption::{EnvelopeEncryption, InMemoryStorage};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::Arc;
 use uuid::Uuid;
 use std::env;
 
 #[cfg(feature = "postgres")]
-use envelope_encryption::{PostgresStorage, PostgresEnvelopeService};
+use envelope_encryption::{PostgresStorage, PostgresEnvelopeService, AesGcmCipher};
 #[cfg(feature = "postgres")]
 use sqlx::PgPool;
 
@@ -188,7 +188,7 @@ async fn run_postgres_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("[GENERATE_DEK] EDEK Nonce (12B): {} bytes", user1_dek.edek_nonce.len());
     println!("[GENERATE_DEK] EDEK Ciphertext: {} bytes", user1_dek.edek_ciphertext.len());
     println!("[GENERATE_DEK] GCM Tag (16B): {} bytes", user1_dek.tag.len());
-    println!("[GENERATE_DEK] EDEK stored in PostgreSQL\n");
+    println!("[GENERATE_DEK] DEK/EDEK stored in MEMORY only (not in PostgreSQL)\n");
 
     // ========================================================================
     // Demo 2: Encrypt data with DEK
@@ -205,13 +205,24 @@ async fn run_postgres_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("[ENCRYPT] Nonce: {} bytes\n", encrypted.nonce.len());
 
     // ========================================================================
-    // Demo 3: Decrypt EDEK to recover DEK
+    // Demo 3: Decrypt EDEK to recover DEK (from in-memory cache)
     // ========================================================================
     println!("=== Demo 3: Decrypt EDEK ===");
-    let recovered_dek = service.decrypt_edek(&user1_dek.dek_id).await?;
+
+    // Reconstruct full EDEK ciphertext (edek + tag)
+    let mut full_edek_ciphertext = user1_dek.edek_ciphertext.clone();
+    full_edek_ciphertext.extend_from_slice(&user1_dek.tag);
+
+    let recovered_dek = service.decrypt_edek(
+        &user1_dek.dek_id,
+        &full_edek_ciphertext,
+        &user1_dek.edek_nonce,
+        &user1_id,
+        user1_dek.kek_version
+    ).await?;
 
     println!("[DECRYPT_EDEK] DEK ID: {}", user1_dek.dek_id);
-    println!("[DECRYPT_EDEK] DEK recovered successfully");
+    println!("[DECRYPT_EDEK] DEK recovered from in-memory cache");
 
     // Decrypt data with recovered DEK
     let decrypted = AesGcmCipher::decrypt(&recovered_dek, &encrypted, Some(content_id.as_bytes()))?;
@@ -242,7 +253,13 @@ async fn run_postgres_demo() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify: Decrypt EDEK still works after KEK rotation
     println!("=== Demo 6: Verify Decryption After KEK Rotation ===");
-    let recovered_dek_after_rotation = service.decrypt_edek(&user1_dek.dek_id).await?;
+    let recovered_dek_after_rotation = service.decrypt_edek(
+        &user1_dek.dek_id,
+        &full_edek_ciphertext,
+        &user1_dek.edek_nonce,
+        &user1_id,
+        rotation_result.new_version  // Now using new KEK version
+    ).await?;
     let decrypted_after = AesGcmCipher::decrypt(
         &recovered_dek_after_rotation,
         &encrypted,
@@ -253,36 +270,36 @@ async fn run_postgres_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("[VERIFY] Plaintext: {:?}\n", String::from_utf8_lossy(&decrypted_after));
 
     // ========================================================================
-    // Demo 7: Disable KEK if unused
+    // Demo 7: Show In-Memory Cache Status
     // ========================================================================
-    println!("=== Demo 7: Disable KEK (if unused) ===");
+    println!("=== Demo 7: In-Memory Cache Status ===");
 
-    // Try to disable User 1's old KEK (should fail - DEKs still reference it)
-    let can_disable_old = service
-        .disable_kek_if_unused(&user1_id, rotation_result.old_version)
-        .await?;
+    let cached_dek_count = service.get_cached_dek_count();
+    let user1_kek_count = service.get_user_kek_count(&user1_id).await?;
+    let user2_kek_count = service.get_user_kek_count(&user2_id).await?;
 
-    println!("[DISABLE_KEK] Attempt to disable old KEK version {}", rotation_result.old_version);
-    println!("[DISABLE_KEK] Can disable: {}", can_disable_old);
-    println!("[DISABLE_KEK] Reason: Active DEKs still reference it");
-    println!("[DISABLE_KEK] Database constraint prevents orphaning DEKs\n");
+    println!("[CACHE] DEKs cached in memory: {}", cached_dek_count);
+    println!("[DATABASE] User 1 KEKs (EKEK) in PostgreSQL: {}", user1_kek_count);
+    println!("[DATABASE] User 2 KEKs (EKEK) in PostgreSQL: {}", user2_kek_count);
+    println!("[NOTE] DEKs/EDEKs are NEVER stored in database, only in memory\n");
 
     // ========================================================================
     // Summary
     // ========================================================================
     println!("=== Summary ===");
     println!("✓ Server Key: Loaded from .env (32-byte base64)");
-    println!("✓ KEKs: Per-user, encrypted by Server Key (EKEK) in PostgreSQL");
-    println!("✓ DEKs: Per-encryption, encrypted by user's KEK (EDEK) in PostgreSQL");
-    println!("✓ Versioning: Explicit version tracking for all KEKs");
+    println!("✓ KEKs (EKEK): Per-user, encrypted by Server Key, stored in PostgreSQL");
+    println!("✓ DEKs: Generated in-memory, NEVER stored in database");
+    println!("✓ EDEKs: Created in-memory for testing, NEVER stored in database");
+    println!("✓ Versioning: Explicit version tracking for KEKs");
     println!("✓ Nonces: Fresh random nonce for each encryption");
     println!("✓ AAD Binding:");
     println!("  - EKEK: AAD = user_id");
     println!("  - EDEK: AAD = dek_id");
     println!("  - Data: AAD = content_id");
     println!("✓ Crypto: AES-256-GCM only, no HKDF/KDFs");
-    println!("✓ Referential Integrity: PostgreSQL enforces KEK->DEK relationships");
-    println!("✓ KEK Rotation: Automatic re-wrapping of all user's DEKs");
+    println!("✓ Database: Stores ONLY EKEKs, no DEKs/EDEKs");
+    println!("✓ KEK Rotation: Automatic re-wrapping of cached EDEKs in memory");
 
     Ok(())
 }
