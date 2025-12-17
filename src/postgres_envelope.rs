@@ -35,7 +35,6 @@ use crate::postgres_storage::{PostgresStorage, StoredKek};
 pub struct PostgresEnvelopeService {
     storage: PostgresStorage,
     server_key: SecureKey,
-    server_key_version: i32,
     // In-memory cache for testing: Maps dek_id → (DEK, EDEK, user_id, kek_version)
     dek_cache: Arc<RwLock<HashMap<Uuid, CachedDek>>>,
 }
@@ -43,7 +42,10 @@ pub struct PostgresEnvelopeService {
 impl PostgresEnvelopeService {
     /// Initialize service with Server Key from environment
     pub async fn new(storage: PostgresStorage) -> Result<Self> {
+        println!("[INIT] Initializing PostgresEnvelopeService...");
+
         // Load Server Key from environment (must be exactly 32 bytes base64)
+        println!("[INIT] Loading SERVER_KEY_BASE64 from .env...");
         let server_key_b64 = std::env::var("SERVER_KEY_BASE64")
             .map_err(|_| EnvelopeError::Config("SERVER_KEY_BASE64 not set in .env".into()))?;
 
@@ -57,28 +59,14 @@ impl PostgresEnvelopeService {
                 server_key_bytes.len()
             )));
         }
+        println!("[INIT] ✓ Server Key loaded successfully (32 bytes)");
+        println!("[INIT] ✓ PostgresEnvelopeService initialized successfully\n");
 
         let server_key = SecureKey::new(server_key_bytes);
-
-        // Get server key version from environment or database
-        let server_key_version = std::env::var("SERVER_KEY_VERSION")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(1);
-
-        // Verify server key version matches database
-        let db_version = storage.get_active_server_key_version().await?;
-        if server_key_version != db_version {
-            return Err(EnvelopeError::Config(format!(
-                "SERVER_KEY_VERSION mismatch: env={}, db={}",
-                server_key_version, db_version
-            )));
-        }
 
         Ok(Self {
             storage,
             server_key,
-            server_key_version,
             dek_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -95,16 +83,26 @@ impl PostgresEnvelopeService {
     ///
     /// Note: DEK and EDEK are NEVER stored in database, only in memory cache
     pub async fn generate_dek(&self, user_id: &Uuid) -> Result<GeneratedDek> {
+        println!("\n[GENERATE_DEK] Starting DEK generation for user: {}", user_id);
+
         // Step 1: Get or create user's KEK from database (EKEK)
+        println!("[GENERATE_DEK] Step 1: Fetching/creating user KEK from PostgreSQL...");
         let kek_info = self.get_or_create_user_kek(user_id).await?;
+        println!("[GENERATE_DEK] ✓ KEK retrieved (version: {})", kek_info.version);
 
         // Step 2: Generate fresh DEK (random 32 bytes, in memory only)
+        println!("[GENERATE_DEK] Step 2: Generating fresh DEK (32 bytes, in-memory)...");
         let dek = SecureKey::generate();
         let dek_id = Uuid::new_v4();
+        println!("[GENERATE_DEK] ✓ DEK generated (ID: {})", dek_id);
+        println!("[GENERATE_DEK] ⚠ DEK is in-memory ONLY, NOT stored in database");
 
         // Step 3: Encrypt DEK with user's KEK (AAD = dek_id for binding)
         // This creates EDEK in memory only
+        println!("[GENERATE_DEK] Step 3: Encrypting DEK with KEK (AAD=dek_id)...");
         let edek = AesGcmCipher::encrypt(&kek_info.kek, dek.as_bytes(), Some(dek_id.as_bytes()))?;
+        println!("[GENERATE_DEK] ✓ EDEK created (ciphertext: {} bytes, nonce: {} bytes)",
+            edek.ciphertext.len(), edek.nonce.len());
 
         // Extract tag (last 16 bytes of ciphertext)
         let ciphertext_len = edek.ciphertext.len();
@@ -113,8 +111,10 @@ impl PostgresEnvelopeService {
         }
         let edek_without_tag = &edek.ciphertext[..ciphertext_len - 16];
         let tag = &edek.ciphertext[ciphertext_len - 16..];
+        println!("[GENERATE_DEK] ✓ Extracted GCM tag (16 bytes)");
 
         // Step 4: Cache DEK + EDEK in memory for testing (NOT in database)
+        println!("[GENERATE_DEK] Step 4: Caching DEK+EDEK in memory (testing only)...");
         self.dek_cache.write().insert(
             dek_id,
             CachedDek {
@@ -126,8 +126,12 @@ impl PostgresEnvelopeService {
                 created_at: Utc::now(),
             },
         );
+        let cache_size = self.dek_cache.read().len();
+        println!("[GENERATE_DEK] ✓ Cached in memory (total cached DEKs: {})", cache_size);
+        println!("[GENERATE_DEK] ⚠ EDEK is in-memory ONLY, NOT stored in database");
 
         // Step 5: Return generated DEK with metadata
+        println!("[GENERATE_DEK] ✓ DEK generation complete\n");
         Ok(GeneratedDek {
             dek_id,
             dek,
@@ -154,16 +158,29 @@ impl PostgresEnvelopeService {
         user_id: &Uuid,
         kek_version: i32,
     ) -> Result<SecureKey> {
+        println!("\n[DECRYPT_EDEK] Starting EDEK decryption (DEK ID: {})", dek_id);
+        println!("[DECRYPT_EDEK] User: {}", user_id);
+        println!("[DECRYPT_EDEK] KEK version: {}", kek_version);
+        println!("[DECRYPT_EDEK] EDEK ciphertext: {} bytes", edek_ciphertext.len());
+        println!("[DECRYPT_EDEK] EDEK nonce: {} bytes", edek_nonce.len());
+
         // Step 1: Try to get from cache (for testing)
+        println!("[DECRYPT_EDEK] Step 1: Checking in-memory cache...");
         if let Some(cached) = self.dek_cache.read().get(dek_id) {
+            println!("[DECRYPT_EDEK] ✓ Found DEK in cache!");
+            println!("[DECRYPT_EDEK] ✓ Returning cached DEK (no database access needed)\n");
             return Ok(cached.dek.clone());
         }
+        println!("[DECRYPT_EDEK] ✗ Not in cache, will decrypt from EDEK");
 
         // Step 2: Not in cache, decrypt from EDEK components
         // Get user's KEK for this version
+        println!("[DECRYPT_EDEK] Step 2: Fetching KEK from PostgreSQL (version: {})...", kek_version);
         let kek_info = self.get_kek_by_version(user_id, kek_version).await?;
+        println!("[DECRYPT_EDEK] ✓ KEK retrieved and decrypted (in-memory)");
 
         // Step 3: Decrypt EDEK to get DEK
+        println!("[DECRYPT_EDEK] Step 3: Decrypting EDEK with KEK (AAD=dek_id)...");
         // Reconstruct full ciphertext (edek + tag if separated)
         let full_ciphertext = if edek_ciphertext.len() < 48 {
             // If tag was separated, we need to get it from somewhere
@@ -175,6 +192,9 @@ impl PostgresEnvelopeService {
 
         let edek = EncryptedData::new(edek_nonce.to_vec(), full_ciphertext);
         let dek_bytes = AesGcmCipher::decrypt(&kek_info.kek, &edek, Some(dek_id.as_bytes()))?;
+        println!("[DECRYPT_EDEK] ✓ DEK decrypted successfully (32 bytes, in-memory)");
+        println!("[DECRYPT_EDEK] ⚠ DEK is in-memory ONLY, NOT stored in database");
+        println!("[DECRYPT_EDEK] ✓ EDEK decryption complete\n");
 
         Ok(SecureKey::new(dek_bytes))
     }
@@ -216,7 +236,6 @@ impl PostgresEnvelopeService {
         let new_stored_kek = StoredKek {
             user_id: *user_id,
             version: new_version,
-            server_key_version: self.server_key_version,
             ekek_ciphertext: new_ekek.ciphertext,
             ekek_nonce: new_ekek.nonce,
             created_at: Utc::now(),
@@ -277,12 +296,22 @@ impl PostgresEnvelopeService {
 
     /// Internal: Get or create user's KEK
     async fn get_or_create_user_kek(&self, user_id: &Uuid) -> Result<KekInfo> {
+        println!("[GET_OR_CREATE_KEK] Checking PostgreSQL for existing KEK (user: {})...", user_id);
+
         // Try to get existing active KEK (EKEK from database)
         if let Some(stored_kek) = self.storage.get_active_kek(user_id).await? {
+            println!("[GET_OR_CREATE_KEK] ✓ Found existing EKEK in PostgreSQL");
+            println!("[GET_OR_CREATE_KEK]   - KEK version: {}", stored_kek.version);
+            println!("[GET_OR_CREATE_KEK]   - EKEK ciphertext: {} bytes", stored_kek.ekek_ciphertext.len());
+            println!("[GET_OR_CREATE_KEK]   - EKEK nonce: {} bytes", stored_kek.ekek_nonce.len());
+
             // Decrypt EKEK to get KEK (in memory)
+            println!("[GET_OR_CREATE_KEK] Decrypting EKEK with Server Key (AAD=user_id)...");
             let ekek = EncryptedData::new(stored_kek.ekek_nonce, stored_kek.ekek_ciphertext);
             let kek_bytes = AesGcmCipher::decrypt(&self.server_key, &ekek, Some(user_id.as_bytes()))?;
             let kek = SecureKey::new(kek_bytes);
+            println!("[GET_OR_CREATE_KEK] ✓ KEK decrypted successfully (32 bytes, in-memory)");
+            println!("[GET_OR_CREATE_KEK] ⚠ KEK is in-memory ONLY, NOT stored in plaintext in database");
 
             return Ok(KekInfo {
                 version: stored_kek.version,
@@ -291,17 +320,23 @@ impl PostgresEnvelopeService {
         }
 
         // Create new KEK for user (in memory)
+        println!("[GET_OR_CREATE_KEK] ✗ No existing KEK found, creating new one...");
+        println!("[GET_OR_CREATE_KEK] Generating new KEK (32 bytes, in-memory)...");
         let kek = SecureKey::generate();
         let version = 1;
+        println!("[GET_OR_CREATE_KEK] ✓ KEK generated (version: {})", version);
 
         // Encrypt KEK with Server Key (AAD = user_id for binding) → EKEK
+        println!("[GET_OR_CREATE_KEK] Encrypting KEK with Server Key (AAD=user_id)...");
         let ekek = AesGcmCipher::encrypt(&self.server_key, kek.as_bytes(), Some(user_id.as_bytes()))?;
+        println!("[GET_OR_CREATE_KEK] ✓ EKEK created (ciphertext: {} bytes, nonce: {} bytes)",
+            ekek.ciphertext.len(), ekek.nonce.len());
 
         // Store EKEK in PostgreSQL (NOT the KEK itself)
+        println!("[GET_OR_CREATE_KEK] Storing EKEK in PostgreSQL...");
         let stored_kek = StoredKek {
             user_id: *user_id,
             version,
-            server_key_version: self.server_key_version,
             ekek_ciphertext: ekek.ciphertext,
             ekek_nonce: ekek.nonce,
             created_at: Utc::now(),
@@ -309,6 +344,8 @@ impl PostgresEnvelopeService {
         };
 
         self.storage.store_kek(&stored_kek).await?;
+        println!("[GET_OR_CREATE_KEK] ✓ EKEK stored in PostgreSQL (user_keks table)");
+        println!("[GET_OR_CREATE_KEK] ⚠ Only EKEK is in database, KEK is in-memory ONLY");
 
         Ok(KekInfo { version, kek })
     }

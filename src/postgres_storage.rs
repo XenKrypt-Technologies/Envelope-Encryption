@@ -33,7 +33,7 @@ impl PostgresStorage {
     pub async fn get_active_kek(&self, user_id: &Uuid) -> Result<Option<StoredKek>> {
         let row = sqlx::query(
             r#"
-            SELECT user_id, version, server_key_version, ekek_ciphertext, ekek_nonce, created_at, is_active
+            SELECT user_id, version, ekek_ciphertext, ekek_nonce, created_at, is_active
             FROM user_keks
             WHERE user_id = $1 AND is_active = TRUE
             "#
@@ -46,7 +46,6 @@ impl PostgresStorage {
         Ok(row.map(|r| StoredKek {
             user_id: r.get("user_id"),
             version: r.get("version"),
-            server_key_version: r.get("server_key_version"),
             ekek_ciphertext: r.get("ekek_ciphertext"),
             ekek_nonce: r.get("ekek_nonce"),
             created_at: r.get("created_at"),
@@ -58,7 +57,7 @@ impl PostgresStorage {
     pub async fn get_kek_by_version(&self, user_id: &Uuid, version: i32) -> Result<Option<StoredKek>> {
         let row = sqlx::query(
             r#"
-            SELECT user_id, version, server_key_version, ekek_ciphertext, ekek_nonce, created_at, is_active
+            SELECT user_id, version, ekek_ciphertext, ekek_nonce, created_at, is_active
             FROM user_keks
             WHERE user_id = $1 AND version = $2
             "#
@@ -72,7 +71,6 @@ impl PostgresStorage {
         Ok(row.map(|r| StoredKek {
             user_id: r.get("user_id"),
             version: r.get("version"),
-            server_key_version: r.get("server_key_version"),
             ekek_ciphertext: r.get("ekek_ciphertext"),
             ekek_nonce: r.get("ekek_nonce"),
             created_at: r.get("created_at"),
@@ -84,7 +82,7 @@ impl PostgresStorage {
     pub async fn get_all_user_keks(&self, user_id: &Uuid) -> Result<Vec<StoredKek>> {
         let rows = sqlx::query(
             r#"
-            SELECT user_id, version, server_key_version, ekek_ciphertext, ekek_nonce, created_at, is_active
+            SELECT user_id, version, ekek_ciphertext, ekek_nonce, created_at, is_active
             FROM user_keks
             WHERE user_id = $1
             ORDER BY version DESC
@@ -98,7 +96,6 @@ impl PostgresStorage {
         Ok(rows.iter().map(|r| StoredKek {
             user_id: r.get("user_id"),
             version: r.get("version"),
-            server_key_version: r.get("server_key_version"),
             ekek_ciphertext: r.get("ekek_ciphertext"),
             ekek_nonce: r.get("ekek_nonce"),
             created_at: r.get("created_at"),
@@ -110,13 +107,12 @@ impl PostgresStorage {
     pub async fn store_kek(&self, kek: &StoredKek) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO user_keks (user_id, version, server_key_version, ekek_ciphertext, ekek_nonce, created_at, is_active)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO user_keks (user_id, version, ekek_ciphertext, ekek_nonce, created_at, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#
         )
         .bind(&kek.user_id)
         .bind(kek.version)
-        .bind(kek.server_key_version)
         .bind(&kek.ekek_ciphertext)
         .bind(&kek.ekek_nonce)
         .bind(kek.created_at)
@@ -146,41 +142,23 @@ impl PostgresStorage {
         Ok(())
     }
 
-    /// Get active server key version
-    pub async fn get_active_server_key_version(&self) -> Result<i32> {
-        let row = sqlx::query(
-            r#"
-            SELECT version
-            FROM server_keys
-            WHERE is_active = TRUE
-            LIMIT 1
-            "#
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| EnvelopeError::Storage(format!("Failed to get active server key version: {}", e)))?;
-
-        Ok(row.get("version"))
-    }
-
-    /// Get all KEKs for server key rotation
-    pub async fn get_keks_by_server_key_version(&self, server_key_version: i32) -> Result<Vec<StoredKek>> {
+    /// Get all active KEKs for server key rotation
+    /// When rotating server key, we need to rewrap all EKEKs
+    pub async fn get_all_active_keks(&self) -> Result<Vec<StoredKek>> {
         let rows = sqlx::query(
             r#"
-            SELECT user_id, version, server_key_version, ekek_ciphertext, ekek_nonce, created_at, is_active
+            SELECT user_id, version, ekek_ciphertext, ekek_nonce, created_at, is_active
             FROM user_keks
-            WHERE server_key_version = $1 AND is_active = TRUE
+            WHERE is_active = TRUE
             "#
         )
-        .bind(server_key_version)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| EnvelopeError::Storage(format!("Failed to get KEKs by server version: {}", e)))?;
+        .map_err(|e| EnvelopeError::Storage(format!("Failed to get all active KEKs: {}", e)))?;
 
         Ok(rows.iter().map(|r| StoredKek {
             user_id: r.get("user_id"),
             version: r.get("version"),
-            server_key_version: r.get("server_key_version"),
             ekek_ciphertext: r.get("ekek_ciphertext"),
             ekek_nonce: r.get("ekek_nonce"),
             created_at: r.get("created_at"),
@@ -195,7 +173,6 @@ impl PostgresStorage {
 pub struct StoredKek {
     pub user_id: Uuid,
     pub version: i32,
-    pub server_key_version: i32,
     pub ekek_ciphertext: Vec<u8>, // KEK encrypted by Server Key (includes GCM tag)
     pub ekek_nonce: Vec<u8>,      // 12-byte nonce
     pub created_at: DateTime<Utc>,
