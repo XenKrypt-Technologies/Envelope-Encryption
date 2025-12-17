@@ -124,6 +124,26 @@ impl PostgresStorage {
         Ok(())
     }
 
+    /// Update an existing KEK (EKEK) - used for server key rotation
+    pub async fn update_kek(&self, kek: &StoredKek) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE user_keks
+            SET ekek_ciphertext = $3, ekek_nonce = $4
+            WHERE user_id = $1 AND version = $2
+            "#
+        )
+        .bind(&kek.user_id)
+        .bind(kek.version)
+        .bind(&kek.ekek_ciphertext)
+        .bind(&kek.ekek_nonce)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| EnvelopeError::Storage(format!("Failed to update KEK: {}", e)))?;
+
+        Ok(())
+    }
+
     /// Disable (deactivate) a KEK
     pub async fn disable_kek(&self, user_id: &Uuid, kek_version: i32) -> Result<()> {
         sqlx::query(

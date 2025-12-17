@@ -129,10 +129,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[USER_2] ✓ Each user has their own KEK in PostgreSQL");
 
     // ========================================================================
-    // Demo 5: Rotate User 1's KEK
+    // Demo 5: Server Key Rotation (Test by changing .env)
     // ========================================================================
     println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 5: KEK Rotation                                             │");
+    println!("│  Demo 5: Server Key Rotation Test                                 │");
+    println!("└{}┘", "─".repeat(68));
+
+    println!("\n[INFO] Testing server key rotation mechanism");
+    println!("[INFO] To test with actual rotation:");
+    println!("[INFO]   1. Stop the program");
+    println!("[INFO]   2. Edit .env and change SERVER_KEY_BASE64");
+    println!("[INFO]   3. Restart and call service.rotate_server_key()");
+    println!("[INFO] For now, calling rotate_server_key() with unchanged key...");
+
+    let server_rotation_result = service.rotate_server_key().await?;
+
+    println!("\n[ROTATE_SERVER_KEY] KEKs Re-wrapped: {}", server_rotation_result.keks_rewrapped);
+    println!("[ROTATE_SERVER_KEY] Users Affected: {}", server_rotation_result.users_affected);
+    if server_rotation_result.keks_rewrapped == 0 {
+        println!("[ROTATE_SERVER_KEY] ✓ Server key unchanged, no rotation performed");
+    } else {
+        println!("[ROTATE_SERVER_KEY] ✓ All KEKs re-wrapped with new server key");
+    }
+
+    // ========================================================================
+    // Demo 5b: Rotate User 1's KEK
+    // ========================================================================
+    println!("\n┌{}┐", "─".repeat(68));
+    println!("│  Demo 5b: User KEK Rotation                                       │");
     println!("└{}┘", "─".repeat(68));
 
     let rotation_result = service.rotate_user_kek(&user1_id).await?;

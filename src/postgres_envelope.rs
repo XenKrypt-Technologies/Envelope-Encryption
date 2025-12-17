@@ -3,7 +3,7 @@ use chrono::Utc;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, Mutex};
 
 use crate::crypto::{AesGcmCipher, EncryptedData, SecureKey};
 use crate::error::{EnvelopeError, Result};
@@ -34,9 +34,11 @@ use crate::postgres_storage::{PostgresStorage, StoredKek};
 /// - EDEKs created in-memory for testing only
 pub struct PostgresEnvelopeService {
     storage: PostgresStorage,
-    server_key: SecureKey,
+    server_key: Arc<RwLock<SecureKey>>,
     // In-memory cache for testing: Maps dek_id → (DEK, EDEK, user_id, kek_version)
     dek_cache: Arc<RwLock<HashMap<Uuid, CachedDek>>>,
+    // Rotation lock: prevents concurrent operations during key rotation
+    rotation_lock: Arc<Mutex<()>>,
 }
 
 impl PostgresEnvelopeService {
@@ -46,6 +48,20 @@ impl PostgresEnvelopeService {
 
         // Load Server Key from environment (must be exactly 32 bytes base64)
         println!("[INIT] Loading SERVER_KEY_BASE64 from .env...");
+        let server_key = Self::load_server_key()?;
+        println!("[INIT] ✓ Server Key loaded successfully (32 bytes)");
+        println!("[INIT] ✓ PostgresEnvelopeService initialized successfully\n");
+
+        Ok(Self {
+            storage,
+            server_key: Arc::new(RwLock::new(server_key)),
+            dek_cache: Arc::new(RwLock::new(HashMap::new())),
+            rotation_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    /// Load server key from environment
+    fn load_server_key() -> Result<SecureKey> {
         let server_key_b64 = std::env::var("SERVER_KEY_BASE64")
             .map_err(|_| EnvelopeError::Config("SERVER_KEY_BASE64 not set in .env".into()))?;
 
@@ -59,16 +75,8 @@ impl PostgresEnvelopeService {
                 server_key_bytes.len()
             )));
         }
-        println!("[INIT] ✓ Server Key loaded successfully (32 bytes)");
-        println!("[INIT] ✓ PostgresEnvelopeService initialized successfully\n");
 
-        let server_key = SecureKey::new(server_key_bytes);
-
-        Ok(Self {
-            storage,
-            server_key,
-            dek_cache: Arc::new(RwLock::new(HashMap::new())),
-        })
+        Ok(SecureKey::new(server_key_bytes))
     }
 
     /// API: generate_dek(user_id) -> (dek, edek, nonce, tag, kek_version)
@@ -83,6 +91,9 @@ impl PostgresEnvelopeService {
     ///
     /// Note: DEK and EDEK are NEVER stored in database, only in memory cache
     pub async fn generate_dek(&self, user_id: &Uuid) -> Result<GeneratedDek> {
+        // Acquire rotation lock to prevent concurrent operations during rotation
+        let _lock = self.rotation_lock.lock();
+
         println!("\n[GENERATE_DEK] Starting DEK generation for user: {}", user_id);
 
         // Step 1: Get or create user's KEK from database (EKEK)
@@ -158,6 +169,9 @@ impl PostgresEnvelopeService {
         user_id: &Uuid,
         kek_version: i32,
     ) -> Result<SecureKey> {
+        // Acquire rotation lock to prevent concurrent operations during rotation
+        let _lock = self.rotation_lock.lock();
+
         println!("\n[DECRYPT_EDEK] Starting EDEK decryption (DEK ID: {})", dek_id);
         println!("[DECRYPT_EDEK] User: {}", user_id);
         println!("[DECRYPT_EDEK] KEK version: {}", kek_version);
@@ -202,17 +216,25 @@ impl PostgresEnvelopeService {
     /// API: rotate_user_kek(user_id)
     ///
     /// Crypto flow:
-    /// 1. Get old active EKEK from database
-    /// 2. Decrypt old EKEK using Server Key → old KEK
-    /// 3. Generate new KEK
-    /// 4. Encrypt new KEK with Server Key → new EKEK
-    /// 5. Store new EKEK in database (incremented version)
-    /// 6. Deactivate old EKEK in database
-    /// 7. Update in-memory cached EDEKs with new KEK (re-wrap)
+    /// 1. Acquire rotation lock to prevent concurrent operations
+    /// 2. Get old active EKEK from database
+    /// 3. Decrypt old EKEK using Server Key → old KEK
+    /// 4. Generate new KEK
+    /// 5. Encrypt new KEK with Server Key → new EKEK
+    /// 6. Deactivate old EKEK in database (removes unique constraint)
+    /// 7. Store new EKEK in database (incremented version)
+    /// 8. Update in-memory cached EDEKs with new KEK (re-wrap)
     ///
     /// Note: Since DEKs/EDEKs are in-memory only, rotation just updates the cache
     pub async fn rotate_user_kek(&self, user_id: &Uuid) -> Result<KekRotationResult> {
+        // Acquire rotation lock to halt all operations during rotation
+        let _lock = self.rotation_lock.lock();
+
+        println!("\n[ROTATE_KEK] Starting KEK rotation for user: {}", user_id);
+        println!("[ROTATE_KEK] ⚠ All operations halted during rotation");
+
         // Step 1: Get old active KEK (EKEK from database)
+        println!("[ROTATE_KEK] Step 1: Fetching old active KEK from database...");
         let old_kek = self
             .storage
             .get_active_kek(user_id)
@@ -220,19 +242,35 @@ impl PostgresEnvelopeService {
             .ok_or_else(|| EnvelopeError::KeyNotFound(format!("No active KEK for user {}", user_id)))?;
 
         let old_version = old_kek.version;
+        println!("[ROTATE_KEK] ✓ Old KEK version: {}", old_version);
 
         // Step 2: Decrypt old EKEK → old KEK (not used, but kept for verification)
+        println!("[ROTATE_KEK] Step 2: Decrypting old EKEK to verify...");
         let old_ekek = EncryptedData::new(old_kek.ekek_nonce, old_kek.ekek_ciphertext);
-        let _old_kek_bytes = AesGcmCipher::decrypt(&self.server_key, &old_ekek, Some(user_id.as_bytes()))?;
+        let server_key = self.server_key.read();
+        let _old_kek_bytes = AesGcmCipher::decrypt(&server_key, &old_ekek, Some(user_id.as_bytes()))?;
+        println!("[ROTATE_KEK] ✓ Old KEK verified successfully");
 
         // Step 3: Generate new KEK
+        println!("[ROTATE_KEK] Step 3: Generating new KEK...");
         let new_kek = SecureKey::generate();
         let new_version = old_version + 1;
+        println!("[ROTATE_KEK] ✓ New KEK version: {}", new_version);
 
         // Step 4: Encrypt new KEK with Server Key → new EKEK
-        let new_ekek = AesGcmCipher::encrypt(&self.server_key, new_kek.as_bytes(), Some(user_id.as_bytes()))?;
+        println!("[ROTATE_KEK] Step 4: Encrypting new KEK with Server Key...");
+        let new_ekek = AesGcmCipher::encrypt(&server_key, new_kek.as_bytes(), Some(user_id.as_bytes()))?;
+        println!("[ROTATE_KEK] ✓ New EKEK created");
 
-        // Step 5: Store new EKEK in database
+        drop(server_key);
+
+        // Step 5: Deactivate old EKEK FIRST (to avoid unique constraint violation)
+        println!("[ROTATE_KEK] Step 5: Deactivating old EKEK in database...");
+        self.storage.disable_kek(user_id, old_version).await?;
+        println!("[ROTATE_KEK] ✓ Old EKEK deactivated");
+
+        // Step 6: Store new EKEK in database
+        println!("[ROTATE_KEK] Step 6: Storing new EKEK in database...");
         let new_stored_kek = StoredKek {
             user_id: *user_id,
             version: new_version,
@@ -243,8 +281,10 @@ impl PostgresEnvelopeService {
         };
 
         self.storage.store_kek(&new_stored_kek).await?;
+        println!("[ROTATE_KEK] ✓ New EKEK stored in database");
 
-        // Step 6: Re-wrap cached EDEKs with new KEK (in-memory only)
+        // Step 7: Re-wrap cached EDEKs with new KEK (in-memory only)
+        println!("[ROTATE_KEK] Step 7: Re-wrapping cached EDEKs with new KEK...");
         let mut cache = self.dek_cache.write();
         let mut rewrapped_count = 0;
 
@@ -266,15 +306,104 @@ impl PostgresEnvelopeService {
         }
 
         drop(cache);
-
-        // Step 7: Deactivate old EKEK in database
-        self.storage.disable_kek(user_id, old_version).await?;
+        println!("[ROTATE_KEK] ✓ Re-wrapped {} cached EDEKs", rewrapped_count);
+        println!("[ROTATE_KEK] ✓ KEK rotation complete\n");
 
         Ok(KekRotationResult {
             user_id: *user_id,
             old_version,
             new_version,
             deks_rewrapped: rewrapped_count,
+        })
+    }
+
+    /// API: rotate_server_key()
+    ///
+    /// Rotates the server key by loading a new key from .env and re-wrapping all active KEKs.
+    /// This should be called after updating SERVER_KEY_BASE64 in .env.
+    ///
+    /// Crypto flow:
+    /// 1. Acquire rotation lock to halt all operations
+    /// 2. Check if .env has a different server key than RAM
+    /// 3. If different, decrypt all active KEKs with old server key
+    /// 4. Encrypt all KEKs with new server key
+    /// 5. Update all KEKs in database
+    /// 6. Update RAM with new server key
+    ///
+    /// Note: ALL operations are halted during server key rotation
+    pub async fn rotate_server_key(&self) -> Result<ServerKeyRotationResult> {
+        // Acquire rotation lock to halt all operations during rotation
+        let _lock = self.rotation_lock.lock();
+
+        println!("\n[ROTATE_SERVER_KEY] Starting server key rotation");
+        println!("[ROTATE_SERVER_KEY] ⚠ ALL OPERATIONS HALTED DURING ROTATION");
+
+        // Step 1: Load new server key from .env
+        println!("[ROTATE_SERVER_KEY] Step 1: Loading new server key from .env...");
+        let new_server_key = Self::load_server_key()?;
+        println!("[ROTATE_SERVER_KEY] ✓ New server key loaded");
+
+        // Step 2: Check if server key has changed
+        println!("[ROTATE_SERVER_KEY] Step 2: Comparing with current server key in RAM...");
+        let old_server_key = self.server_key.read().clone();
+
+        if old_server_key.as_bytes() == new_server_key.as_bytes() {
+            println!("[ROTATE_SERVER_KEY] ⚠ Server key unchanged, no rotation needed");
+            return Ok(ServerKeyRotationResult {
+                keks_rewrapped: 0,
+                users_affected: 0,
+            });
+        }
+        println!("[ROTATE_SERVER_KEY] ✓ Server key has changed, proceeding with rotation");
+
+        // Step 3: Get all active KEKs from database
+        println!("[ROTATE_SERVER_KEY] Step 3: Fetching all active KEKs from database...");
+        let all_keks = self.storage.get_all_active_keks().await?;
+        println!("[ROTATE_SERVER_KEY] ✓ Found {} active KEKs to rewrap", all_keks.len());
+
+        // Step 4: Rewrap all KEKs with new server key
+        println!("[ROTATE_SERVER_KEY] Step 4: Rewrapping all KEKs with new server key...");
+        let mut keks_rewrapped = 0;
+        let mut users_affected = std::collections::HashSet::new();
+
+        for stored_kek in all_keks {
+            // Decrypt EKEK with old server key
+            let old_ekek = EncryptedData::new(stored_kek.ekek_nonce.clone(), stored_kek.ekek_ciphertext.clone());
+            let kek_bytes = AesGcmCipher::decrypt(&old_server_key, &old_ekek, Some(stored_kek.user_id.as_bytes()))?;
+
+            // Encrypt KEK with new server key
+            let new_ekek = AesGcmCipher::encrypt(&new_server_key, &kek_bytes, Some(stored_kek.user_id.as_bytes()))?;
+
+            // Update KEK in database
+            let updated_kek = StoredKek {
+                user_id: stored_kek.user_id,
+                version: stored_kek.version,
+                ekek_ciphertext: new_ekek.ciphertext,
+                ekek_nonce: new_ekek.nonce,
+                created_at: stored_kek.created_at,
+                is_active: stored_kek.is_active,
+            };
+
+            self.storage.update_kek(&updated_kek).await?;
+            keks_rewrapped += 1;
+            users_affected.insert(stored_kek.user_id);
+
+            println!("[ROTATE_SERVER_KEY]   ✓ Rewrapped KEK for user {} (version {})",
+                stored_kek.user_id, stored_kek.version);
+        }
+
+        // Step 5: Update server key in RAM
+        println!("[ROTATE_SERVER_KEY] Step 5: Updating server key in RAM...");
+        *self.server_key.write() = new_server_key;
+        println!("[ROTATE_SERVER_KEY] ✓ Server key updated in RAM");
+
+        println!("[ROTATE_SERVER_KEY] ✓ Server key rotation complete");
+        println!("[ROTATE_SERVER_KEY] ✓ Rewrapped {} KEKs for {} users\n",
+            keks_rewrapped, users_affected.len());
+
+        Ok(ServerKeyRotationResult {
+            keks_rewrapped,
+            users_affected: users_affected.len(),
         })
     }
 
@@ -291,7 +420,7 @@ impl PostgresEnvelopeService {
 
     /// Clear DEK cache (for testing)
     pub fn clear_dek_cache(&self) {
-        self.dek_cache.write().clear();
+        self.dek_cache.write().clear()
     }
 
     /// Internal: Get or create user's KEK
@@ -308,7 +437,8 @@ impl PostgresEnvelopeService {
             // Decrypt EKEK to get KEK (in memory)
             println!("[GET_OR_CREATE_KEK] Decrypting EKEK with Server Key (AAD=user_id)...");
             let ekek = EncryptedData::new(stored_kek.ekek_nonce, stored_kek.ekek_ciphertext);
-            let kek_bytes = AesGcmCipher::decrypt(&self.server_key, &ekek, Some(user_id.as_bytes()))?;
+            let server_key = self.server_key.read();
+            let kek_bytes = AesGcmCipher::decrypt(&server_key, &ekek, Some(user_id.as_bytes()))?;
             let kek = SecureKey::new(kek_bytes);
             println!("[GET_OR_CREATE_KEK] ✓ KEK decrypted successfully (32 bytes, in-memory)");
             println!("[GET_OR_CREATE_KEK] ⚠ KEK is in-memory ONLY, NOT stored in plaintext in database");
@@ -328,7 +458,8 @@ impl PostgresEnvelopeService {
 
         // Encrypt KEK with Server Key (AAD = user_id for binding) → EKEK
         println!("[GET_OR_CREATE_KEK] Encrypting KEK with Server Key (AAD=user_id)...");
-        let ekek = AesGcmCipher::encrypt(&self.server_key, kek.as_bytes(), Some(user_id.as_bytes()))?;
+        let server_key = self.server_key.read();
+        let ekek = AesGcmCipher::encrypt(&server_key, kek.as_bytes(), Some(user_id.as_bytes()))?;
         println!("[GET_OR_CREATE_KEK] ✓ EKEK created (ciphertext: {} bytes, nonce: {} bytes)",
             ekek.ciphertext.len(), ekek.nonce.len());
 
@@ -362,7 +493,8 @@ impl PostgresEnvelopeService {
 
         // Decrypt EKEK to get KEK (in memory)
         let ekek = EncryptedData::new(stored_kek.ekek_nonce, stored_kek.ekek_ciphertext);
-        let kek_bytes = AesGcmCipher::decrypt(&self.server_key, &ekek, Some(user_id.as_bytes()))?;
+        let server_key = self.server_key.read();
+        let kek_bytes = AesGcmCipher::decrypt(&server_key, &ekek, Some(user_id.as_bytes()))?;
         let kek = SecureKey::new(kek_bytes);
 
         Ok(KekInfo { version, kek })
@@ -387,6 +519,13 @@ pub struct KekRotationResult {
     pub old_version: i32,
     pub new_version: i32,
     pub deks_rewrapped: usize,
+}
+
+/// Result of server key rotation
+#[derive(Debug)]
+pub struct ServerKeyRotationResult {
+    pub keks_rewrapped: usize,
+    pub users_affected: usize,
 }
 
 /// Internal KEK info (in-memory only)

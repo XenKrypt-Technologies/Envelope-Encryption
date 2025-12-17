@@ -16,4 +16,4 @@ pub use envelope::{EnvelopeEncryption, EncryptedEnvelope};
 
 // PostgreSQL exports
 pub use postgres_storage::{PostgresStorage, StoredKek};
-pub use postgres_envelope::{PostgresEnvelopeService, GeneratedDek, KekRotationResult};
+pub use postgres_envelope::{PostgresEnvelopeService, GeneratedDek, KekRotationResult, ServerKeyRotationResult};
