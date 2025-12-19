@@ -3,21 +3,18 @@
 ## Setup PostgreSQL (Linux)
 
 ```bash
-# 1. Create database
-psql -U postgres -c "CREATE DATABASE envelope_encryption;"
-
-# 2. Run migration
-psql -U postgres -d envelope_encryption -f migrations/001_init_schema.sql
-
-# 3. Verify
-psql -U postgres -d envelope_encryption -c "\dt"
+# Run schema (this will drop and recreate the database)
+psql -U postgres -f schema.sql
 ```
 
 Expected output:
 ```
- Schema |   Name    | Type  |  Owner
---------+-----------+-------+----------
- public | user_keks | table | postgres
+DROP DATABASE
+CREATE DATABASE
+You are now connected to database "envelope_encryption" as user "postgres".
+CREATE TYPE
+CREATE TABLE
+...
 ```
 
 ## Configure
@@ -25,7 +22,6 @@ Expected output:
 Update `.env` with your database password:
 ```bash
 DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/envelope_encryption
-SERVER_KEY_BASE64=JEVim9SuHAvJQ/6++itTa/2PIUylMtpbhZ/E41cJc+o=
 ```
 
 ## Run

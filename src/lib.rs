@@ -15,5 +15,5 @@ pub use key_manager::{KeyManager, DekInfo, UserKekInfo, RotationResult, KeyStats
 pub use envelope::{EnvelopeEncryption, EncryptedEnvelope};
 
 // PostgreSQL exports
-pub use postgres_storage::{PostgresStorage, StoredKek};
-pub use postgres_envelope::{PostgresEnvelopeService, GeneratedDek, KekRotationResult, ServerKeyRotationResult};
+pub use postgres_storage::{PostgresStorage, StoredKek, KekStatus};
+pub use postgres_envelope::{PostgresEnvelopeService, GeneratedDek, BulkRotationResult, UserKekRotationResult};

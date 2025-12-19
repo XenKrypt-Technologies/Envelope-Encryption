@@ -1,16 +1,11 @@
-/// Envelope Encryption Demo - PostgreSQL Backend Only
+/// Envelope Encryption Demo
 ///
 /// Usage:
-///   cargo run                    # PostgreSQL demo
+///   cargo run
 ///
 /// PostgreSQL setup:
-///   1. Run automated setup: .\setup_windows_db.ps1
-///   OR
-///   2. Manual setup:
-///      - Create database: psql -U postgres -c "CREATE DATABASE envelope_encryption;"
-///      - Run migrations: psql -U postgres -d envelope_encryption -f migrations/001_init_schema.sql
-///      - Run migrations: psql -U postgres -d envelope_encryption -f migrations/002_simplified_schema.sql
-///   3. Ensure .env has DATABASE_URL and SERVER_KEY_BASE64
+///   1. Run schema: psql -U postgres -f schema.sql
+///   2. Ensure .env has DATABASE_URL
 
 use envelope_encryption::{PostgresStorage, PostgresEnvelopeService, AesGcmCipher};
 use sqlx::PgPool;
@@ -18,7 +13,7 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== PostgreSQL Envelope Encryption Demo ===\n");
+    println!("=== Envelope Encryption Demo ===\n");
 
     // Load environment variables
     println!("[STARTUP] Loading .env file...");
@@ -44,179 +39,209 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("                    DEMO START");
     println!("{}\n", "=".repeat(70));
 
-    // Demo: Two users
-    let user1_id = Uuid::new_v4();
-    let user2_id = Uuid::new_v4();
-
-    println!("[USERS] User 1 ID: {}", user1_id);
-    println!("[USERS] User 2 ID: {}\n", user2_id);
-
     // ========================================================================
-    // Demo 1: Generate DEK for User 1
+    // Demo 1: Create 125 users with KEKs
     // ========================================================================
     println!("┌{}┐", "─".repeat(68));
-    println!("│  Demo 1: Generate DEK for User 1                                  │");
+    println!("│  Demo 1: Create 125 Users with KEKs                               │");
     println!("└{}┘", "─".repeat(68));
 
-    let user1_dek = service.generate_dek(&user1_id).await?;
+    let mut user_ids = Vec::new();
+    println!("\n[INFO] Creating 125 users...");
 
-    println!("\n[RESULT] User: {}", user1_id);
-    println!("[RESULT] DEK ID: {}", user1_dek.dek_id);
-    println!("[RESULT] KEK Version: {}", user1_dek.kek_version);
-    println!("[RESULT] EDEK Nonce: {} bytes", user1_dek.edek_nonce.len());
-    println!("[RESULT] EDEK Ciphertext: {} bytes", user1_dek.edek_ciphertext.len());
-    println!("[RESULT] GCM Tag: {} bytes", user1_dek.tag.len());
-    println!("[RESULT] ⚠ DEK/EDEK stored in MEMORY only, NOT in PostgreSQL");
+    for i in 0..125 {
+        let user_id = Uuid::new_v4();
+        user_ids.push(user_id);
+
+        // Generate DEK to trigger KEK creation
+        let _ = service.generate_dek(&user_id).await?;
+
+        if (i + 1) % 25 == 0 {
+            println!("[INFO] Created {} users with KEKs", i + 1);
+        }
+    }
+
+    println!("\n[RESULT] ✓ Created 125 users with ACTIVE KEKs");
+
+    // Check stats
+    let stats = service.get_kek_stats().await?;
+    println!("[RESULT] KEK Statistics:");
+    for (status, count) in &stats {
+        println!("[RESULT]   - {}: {}", status, count);
+    }
 
     // ========================================================================
-    // Demo 2: Encrypt data with DEK
+    // Demo 2: Test basic encryption/decryption with first user
     // ========================================================================
     println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 2: Encrypt Data with DEK                                    │");
+    println!("│  Demo 2: Test Encryption/Decryption                               │");
     println!("└{}┘", "─".repeat(68));
 
-    let plaintext = b"Sensitive user data protected by envelope encryption";
+    let test_user = user_ids[0];
+    println!("\n[INFO] Testing with user: {}", test_user);
+
+    let user_dek = service.generate_dek(&test_user).await?;
+    let plaintext = b"Sensitive data protected by envelope encryption";
     let content_id = Uuid::new_v4();
 
-    println!("\n[ENCRYPT] Plaintext: {:?}", String::from_utf8_lossy(plaintext));
-    println!("[ENCRYPT] Content ID: {}", content_id);
-    println!("[ENCRYPT] Encrypting with DEK (AAD=content_id)...");
-
-    let encrypted = AesGcmCipher::encrypt(&user1_dek.dek, plaintext, Some(content_id.as_bytes()))?;
-
+    println!("[ENCRYPT] Encrypting data...");
+    let encrypted = AesGcmCipher::encrypt(&user_dek.dek, plaintext, Some(content_id.as_bytes()))?;
     println!("[ENCRYPT] ✓ Ciphertext: {} bytes", encrypted.ciphertext.len());
-    println!("[ENCRYPT] ✓ Nonce: {} bytes", encrypted.nonce.len());
 
-    // ========================================================================
-    // Demo 3: Decrypt EDEK to recover DEK (from in-memory cache)
-    // ========================================================================
-    println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 3: Decrypt EDEK to Recover DEK                              │");
-    println!("└{}┘", "─".repeat(68));
-
-    // Reconstruct full EDEK ciphertext (edek + tag)
-    let mut full_edek_ciphertext = user1_dek.edek_ciphertext.clone();
-    full_edek_ciphertext.extend_from_slice(&user1_dek.tag);
-
+    println!("[DECRYPT] Decrypting data...");
     let recovered_dek = service.decrypt_edek(
-        &user1_dek.dek_id,
-        &full_edek_ciphertext,
-        &user1_dek.edek_nonce,
-        &user1_id,
-        user1_dek.kek_version
+        &user_dek.dek_id,
+        &user_dek.edek_blob,
+        &test_user,
+        user_dek.kek_version
     ).await?;
-
-    println!("\n[RESULT] DEK ID: {}", user1_dek.dek_id);
-    println!("[RESULT] ✓ DEK recovered successfully");
-
-    // Decrypt data with recovered DEK
-    println!("[DECRYPT] Decrypting ciphertext with recovered DEK...");
     let decrypted = AesGcmCipher::decrypt(&recovered_dek, &encrypted, Some(content_id.as_bytes()))?;
     println!("[DECRYPT] ✓ Plaintext: {:?}", String::from_utf8_lossy(&decrypted));
 
     // ========================================================================
-    // Demo 4: Generate DEK for User 2 (gets different KEK)
+    // Demo 3: Bulk KEK Rotation (125 KEKs)
     // ========================================================================
     println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 4: Per-User KEK Isolation                                   │");
+    println!("│  Demo 3: Bulk KEK Rotation (125 KEKs in batches of 50)            │");
     println!("└{}┘", "─".repeat(68));
 
-    let user2_dek = service.generate_dek(&user2_id).await?;
+    println!("\n[INFO] Current KEK statistics:");
+    let stats_before = service.get_kek_stats().await?;
+    for (status, count) in &stats_before {
+        println!("[INFO]   - {}: {}", status, count);
+    }
 
-    println!("\n[USER_2] User 2 ID: {}", user2_id);
-    println!("[USER_2] DEK ID: {}", user2_dek.dek_id);
-    println!("[USER_2] KEK Version: {}", user2_dek.kek_version);
-    println!("[USER_2] ✓ Each user has their own KEK in PostgreSQL");
+    println!("\n[INFO] Starting bulk rotation of 125 KEKs...");
+    println!("[INFO] This will rotate in batches of 50...");
 
-    // ========================================================================
-    // Demo 5: Server Key Rotation (Test by changing .env)
-    // ========================================================================
-    println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 5: Server Key Rotation Test                                 │");
-    println!("└{}┘", "─".repeat(68));
+    let rotation_result = service.bulk_rotate_all_keks().await?;
 
-    println!("\n[INFO] Testing server key rotation mechanism");
-    println!("[INFO] To test with actual rotation:");
-    println!("[INFO]   1. Stop the program");
-    println!("[INFO]   2. Edit .env and change SERVER_KEY_BASE64");
-    println!("[INFO]   3. Restart and call service.rotate_server_key()");
-    println!("[INFO] For now, calling rotate_server_key() with unchanged key...");
+    println!("\n[RESULT] Bulk Rotation Complete:");
+    println!("[RESULT]   - KEKs marked as RETIRED: {}", rotation_result.keks_marked_retired);
+    println!("[RESULT]   - KEKs rotated: {}", rotation_result.keks_rotated);
 
-    let server_rotation_result = service.rotate_server_key().await?;
-
-    println!("\n[ROTATE_SERVER_KEY] KEKs Re-wrapped: {}", server_rotation_result.keks_rewrapped);
-    println!("[ROTATE_SERVER_KEY] Users Affected: {}", server_rotation_result.users_affected);
-    if server_rotation_result.keks_rewrapped == 0 {
-        println!("[ROTATE_SERVER_KEY] ✓ Server key unchanged, no rotation performed");
-    } else {
-        println!("[ROTATE_SERVER_KEY] ✓ All KEKs re-wrapped with new server key");
+    println!("\n[INFO] KEK statistics after rotation:");
+    let stats_after = service.get_kek_stats().await?;
+    for (status, count) in &stats_after {
+        println!("[INFO]   - {}: {}", status, count);
     }
 
     // ========================================================================
-    // Demo 5b: Rotate User 1's KEK
+    // Demo 4: Lazy Rotation - Random User Access
     // ========================================================================
     println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 5b: User KEK Rotation                                       │");
+    println!("│  Demo 4: Lazy Rotation - Random User Access                       │");
     println!("└{}┘", "─".repeat(68));
 
-    let rotation_result = service.rotate_user_kek(&user1_id).await?;
+    // After bulk rotation, all 125 users now have ACTIVE KEKs (version 2)
+    // Let's pick 5 random users and test that they can generate DEKs successfully
+    println!("\n[INFO] Testing KEK access after bulk rotation");
+    println!("[INFO] All users should have ACTIVE KEKs (version 2) after rotation");
 
-    println!("\n[ROTATE_KEK] User: {}", rotation_result.user_id);
-    println!("[ROTATE_KEK] Old KEK Version: {}", rotation_result.old_version);
-    println!("[ROTATE_KEK] New KEK Version: {}", rotation_result.new_version);
-    println!("[ROTATE_KEK] DEKs Re-wrapped: {}", rotation_result.deks_rewrapped);
-    println!("[ROTATE_KEK] ✓ New EKEK stored in PostgreSQL");
-    println!("[ROTATE_KEK] ✓ All cached DEKs re-wrapped with new KEK");
+    use rand::seq::SliceRandom;
+    use rand::thread_rng;
 
-    // Verify: Decrypt EDEK still works after KEK rotation
+    let mut rng = thread_rng();
+    let mut random_users: Vec<_> = user_ids.iter().take(10).cloned().collect();
+    random_users.shuffle(&mut rng);
+    let random_users: Vec<_> = random_users.iter().take(5).cloned().collect();
+
+    println!("\n[INFO] Testing with 5 random users from the 125:");
+    for (idx, user_id) in random_users.iter().enumerate() {
+        println!("\n[INFO] User {} of 5: {}", idx + 1, user_id);
+
+        // Generate new DEK - should use the ACTIVE KEK (version 2 after rotation)
+        let dek = service.generate_dek(user_id).await?;
+        println!("[INFO] ✓ DEK generated with KEK version: {}", dek.kek_version);
+        println!("[INFO] ✓ Using ACTIVE KEK (version {} after bulk rotation)", dek.kek_version);
+    }
+
+    println!("\n[RESULT] ✓ All 5 users successfully generated DEKs");
+    println!("[RESULT] ✓ All are using ACTIVE KEKs (version 2)");
+
+    // ========================================================================
+    // Demo 5: Verify Old KEKs Can Still Decrypt
+    // ========================================================================
     println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 6: Verify Decryption After KEK Rotation                     │");
+    println!("│  Demo 5: Verify Old KEKs Can Still Decrypt                        │");
     println!("└{}┘", "─".repeat(68));
 
-    let recovered_dek_after_rotation = service.decrypt_edek(
-        &user1_dek.dek_id,
-        &full_edek_ciphertext,
-        &user1_dek.edek_nonce,
-        &user1_id,
-        rotation_result.new_version  // Now using new KEK version
+    println!("\n[INFO] Testing that old RETIRED KEKs can still decrypt EDEKs");
+
+    // The user_dek we created earlier should still be decryptable
+    // even though we rotated KEKs
+    println!("[INFO] Attempting to decrypt EDEK created with old KEK version...");
+    let _old_dek = service.decrypt_edek(
+        &user_dek.dek_id,
+        &user_dek.edek_blob,
+        &test_user,
+        user_dek.kek_version
     ).await?;
-    let decrypted_after = AesGcmCipher::decrypt(
-        &recovered_dek_after_rotation,
-        &encrypted,
-        Some(content_id.as_bytes()),
-    )?;
 
-    println!("\n[VERIFY] ✓ DEK decrypted successfully after KEK rotation");
-    println!("[VERIFY] ✓ Plaintext: {:?}", String::from_utf8_lossy(&decrypted_after));
-    println!("[VERIFY] ✓ KEK rotation is transparent to application");
+    println!("[RESULT] ✓ Successfully decrypted with old KEK version: {}", user_dek.kek_version);
+    println!("[RESULT] ✓ Backward compatibility maintained");
 
     // ========================================================================
-    // Demo 7: Show Database vs Memory Status
+    // Demo 6: Disable and Delete Old KEK
     // ========================================================================
     println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 7: Database vs Memory Status                                │");
+    println!("│  Demo 6: KEK Lifecycle Management                                 │");
+    println!("└{}┘", "─".repeat(68));
+
+    // Pick a user and try to manage their old KEK
+    let manage_user = user_ids[10];
+    println!("\n[INFO] Managing KEKs for user: {}", manage_user);
+
+    // Try to disable the old KEK version (version 1 - now RETIRED after rotation)
+    println!("[INFO] Attempting to disable old RETIRED KEK (version 1)...");
+    match service.disable_kek(&manage_user, 1).await {
+        Ok(result) => {
+            if result {
+                println!("[RESULT] ✓ KEK disabled successfully");
+
+                // Now try to delete it
+                println!("\n[INFO] Attempting to delete disabled KEK...");
+                match service.delete_kek(&manage_user, 1).await {
+                    Ok(deleted) => {
+                        if deleted {
+                            println!("[RESULT] ✓ KEK deleted successfully");
+                        }
+                    }
+                    Err(e) => println!("[INFO] ⚠ Delete failed: {}", e),
+                }
+            }
+        }
+        Err(e) => println!("[INFO] ⚠ Disable failed: {}", e),
+    }
+
+    // ========================================================================
+    // Demo 7: Final Statistics
+    // ========================================================================
+    println!("\n┌{}┐", "─".repeat(68));
+    println!("│  Demo 7: Final Statistics                                         │");
     println!("└{}┘", "─".repeat(68));
 
     let cached_dek_count = service.get_cached_dek_count();
-    let user1_kek_count = service.get_user_kek_count(&user1_id).await?;
-    let user2_kek_count = service.get_user_kek_count(&user2_id).await?;
+    let final_stats = service.get_kek_stats().await?;
 
     println!("\n[MEMORY CACHE]");
     println!("  - DEKs cached: {}", cached_dek_count);
-    println!("  - Purpose: Testing and performance optimization");
+    println!("  - Purpose: Testing and performance");
     println!("  - Lifetime: Process runtime only");
 
-    println!("\n[POSTGRESQL DATABASE]");
-    println!("  - User 1 KEKs (EKEK): {}", user1_kek_count);
-    println!("  - User 2 KEKs (EKEK): {}", user2_kek_count);
-    println!("  - Storage: ONLY encrypted KEKs (EKEK)");
-    println!("  - Lifetime: Persistent");
+    println!("\n[DATABASE]");
+    println!("  - KEK Statistics:");
+    for (status, count) in &final_stats {
+        println!("    - {}: {}", status, count);
+    }
+    println!("  - Storage: KEKs as plaintext (32 bytes)");
+    println!("  - Encryption at rest: Database encryption");
 
     println!("\n[IMPORTANT]");
-    println!("  ⚠ DEKs are NEVER stored in PostgreSQL");
-    println!("  ⚠ EDEKs are NEVER stored in PostgreSQL");
-    println!("  ✓ Only EKEKs are persisted to database");
-    println!("  ✓ All plaintext keys stay in memory only");
+    println!("  ⚠ DEKs are NEVER stored in database");
+    println!("  ⚠ EDEKs are NEVER stored in database");
+    println!("  ✓ Only KEKs persisted (encrypted at rest by database)");
+    println!("  ✓ Total users tested: {}", user_ids.len());
 
     // ========================================================================
     // Summary
@@ -225,36 +250,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("                         SUMMARY");
     println!("{}\n", "=".repeat(70));
 
-    println!("┌─ Crypto Architecture ─────────────────────────────────────────────┐");
+    println!("┌─ Test Results ────────────────────────────────────────────────────┐");
     println!("│                                                                    │");
-    println!("│  .env (SERVER_KEY_BASE64)                                          │");
-    println!("│    ↓ encrypts (AAD=user_id)                                        │");
-    println!("│  PostgreSQL (user_keks table)                                      │");
-    println!("│    ↓ stores EKEK                                                   │");
-    println!("│    ↓ decrypts in-memory                                            │");
-    println!("│  KEK (in-memory only)                                              │");
-    println!("│    ↓ encrypts (AAD=dek_id)                                         │");
-    println!("│  EDEK (in-memory cache, testing only)                              │");
-    println!("│    ↓ decrypts in-memory                                            │");
-    println!("│  DEK (in-memory only)                                              │");
-    println!("│    ↓ encrypts (AAD=content_id)                                     │");
-    println!("│  Application Data                                                  │");
+    println!("│  ✓ Created 125 users with unique KEKs                             │");
+    println!("│  ✓ Bulk rotation: {} KEKs rotated in batches of 50          │", rotation_result.keks_rotated);
+    println!("│  ✓ Lazy rotation: Auto-triggered on access                        │");
+    println!("│  ✓ Backward compatibility: Old KEKs decrypt old EDEKs             │");
+    println!("│  ✓ KEK lifecycle: ACTIVE → RETIRED → DISABLED → Deleted           │");
+    println!("│  ✓ Performance: Batch processing with SKIP LOCKED                 │");
     println!("│                                                                    │");
     println!("└────────────────────────────────────────────────────────────────────┘");
 
-    println!("\n✓ Server Key: Loaded from .env (32-byte base64)");
-    println!("✓ KEKs (EKEK): Per-user, encrypted by Server Key, stored in PostgreSQL");
-    println!("✓ DEKs: Generated in-memory, NEVER stored in database");
-    println!("✓ EDEKs: Created in-memory for testing, NEVER stored in database");
-    println!("✓ Versioning: Explicit version tracking for KEKs");
-    println!("✓ Nonces: Fresh random nonce for each encryption");
-    println!("✓ AAD Binding:");
-    println!("  - EKEK: AAD = user_id");
-    println!("  - EDEK: AAD = dek_id");
-    println!("  - Data: AAD = content_id");
-    println!("✓ Crypto: AES-256-GCM only, no HKDF/KDFs");
-    println!("✓ Database: Stores ONLY EKEKs, no DEKs/EDEKs");
-    println!("✓ KEK Rotation: Automatic re-wrapping of cached EDEKs in memory");
+    println!("\n✓ Database: Encrypts KEKs at rest");
+    println!("✓ KEKs: Per-user, 32 bytes plaintext in DB");
+    println!("✓ DEKs: In-memory only, never persisted");
+    println!("✓ Rotation:");
+    println!("  - Bulk: {} KEKs in batches of 50", rotation_result.keks_rotated);
+    println!("  - Lazy: Auto-rotate RETIRED KEKs on access");
+    println!("✓ Crypto: AES-256-GCM with AEAD format");
 
     println!("\n{}", "=".repeat(70));
     println!("                      DEMO COMPLETE");

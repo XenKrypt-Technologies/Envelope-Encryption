@@ -57,6 +57,30 @@ impl EncryptedData {
         Self { nonce, ciphertext }
     }
 
+    /// Convert to industry-standard AEAD blob format: nonce || ciphertext || tag
+    /// For AES-256-GCM: 12 bytes nonce + ciphertext + 16 bytes tag
+    pub fn to_aead_blob(&self) -> Vec<u8> {
+        [self.nonce.as_slice(), self.ciphertext.as_slice()].concat()
+    }
+
+    /// Parse from AEAD blob format: nonce || ciphertext || tag
+    /// For AES-256-GCM encrypting 32-byte key: total 60 bytes
+    pub fn from_aead_blob(blob: &[u8]) -> Result<Self> {
+        if blob.len() < NONCE_SIZE + TAG_SIZE {
+            return Err(EnvelopeError::Crypto(format!(
+                "AEAD blob too small: expected at least {} bytes, got {}",
+                NONCE_SIZE + TAG_SIZE,
+                blob.len()
+            )));
+        }
+
+        let (nonce, ciphertext) = blob.split_at(NONCE_SIZE);
+        Ok(Self {
+            nonce: nonce.to_vec(),
+            ciphertext: ciphertext.to_vec(),
+        })
+    }
+
     pub fn to_base64(&self) -> String {
         use base64::{engine::general_purpose::STANDARD, Engine};
         let combined = [self.nonce.as_slice(), self.ciphertext.as_slice()].concat();
