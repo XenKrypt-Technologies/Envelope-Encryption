@@ -1,0 +1,123 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Envelope Encryption"><title>envelope_encryption - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="envelope_encryption" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.1 (ed61e7d7e 2025-11-07)" data-channel="1.91.1" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../static.files/storage-e2aeef58.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate envelope_encryption</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../envelope_encryption/index.html">envelope_<wbr>encryption</a><span class="version">0.1.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#envelope-encryption" title="Envelope Encryption">Envelope Encryption</a><ul><li><a href="#overview" title="Overview">Overview</a></li><li><a href="#quick-start" title="Quick Start">Quick Start</a></li><li><a href="#key-features" title="Key Features">Key Features</a></li><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#core-types" title="Core Types">Core Types</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul></li></ul><h3><a href="#reexports">Crate Items</a></h3><ul class="block"><li><a href="#reexports" title="Re-exports">Re-exports</a></li><li><a href="#modules-1" title="Modules">Modules</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><h1>Crate <span>envelope_<wbr>encryption</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/envelope_encryption/lib.rs.html#1-280">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><h2 id="envelope-encryption"><a class="doc-anchor" href="#envelope-encryption">§</a>Envelope Encryption</h2>
+<p>A Rust implementation of envelope encryption with per-user key encryption keys and PostgreSQL-backed storage.</p>
+<h3 id="overview"><a class="doc-anchor" href="#overview">§</a>Overview</h3>
+<p>This library provides a complete envelope encryption solution where:</p>
+<ul>
+<li><strong>Data Encryption Keys (DEKs)</strong> are one-time keys that encrypt actual data</li>
+<li><strong>Key Encryption Keys (KEKs)</strong> are per-user master keys that wrap/encrypt DEKs</li>
+<li><strong>Database Encryption</strong> protects KEKs at rest in PostgreSQL</li>
+</ul>
+<h3 id="quick-start"><a class="doc-anchor" href="#quick-start">§</a>Quick Start</h3>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>envelope_encryption::{PostgresStorage, PostgresEnvelopeService, AesGcmCipher};
+<span class="kw">use </span>sqlx::PgPool;
+<span class="kw">use </span>uuid::Uuid;
+
+<span class="comment">// Initialize service
+</span><span class="kw">let </span>pool = PgPool::connect(<span class="string">"postgresql://localhost/envelope_encryption"</span>).<span class="kw">await</span><span class="question-mark">?</span>;
+<span class="kw">let </span>storage = PostgresStorage::new(pool);
+<span class="kw">let </span>service = PostgresEnvelopeService::new(storage).<span class="kw">await</span><span class="question-mark">?</span>;
+
+<span class="comment">// Generate DEK for a user
+</span><span class="kw">let </span>user_id = Uuid::new_v4();
+<span class="kw">let </span>dek = service.generate_dek(<span class="kw-2">&amp;</span>user_id).<span class="kw">await</span><span class="question-mark">?</span>;
+
+<span class="comment">// Encrypt data
+</span><span class="kw">let </span>plaintext = <span class="string">b"Sensitive data"</span>;
+<span class="kw">let </span>encrypted = AesGcmCipher::encrypt(<span class="kw-2">&amp;</span>dek.dek, plaintext, <span class="prelude-val">None</span>)<span class="question-mark">?</span>;
+
+<span class="comment">// Decrypt data
+</span><span class="kw">let </span>recovered_dek = service.decrypt_edek(
+    <span class="kw-2">&amp;</span>dek.dek_id,
+    <span class="kw-2">&amp;</span>dek.edek_blob,
+    <span class="kw-2">&amp;</span>user_id,
+    dek.kek_version
+).<span class="kw">await</span><span class="question-mark">?</span>;
+<span class="kw">let </span>decrypted = AesGcmCipher::decrypt(<span class="kw-2">&amp;</span>recovered_dek, <span class="kw-2">&amp;</span>encrypted, <span class="prelude-val">None</span>)<span class="question-mark">?</span>;</code></pre></div><h3 id="key-features"><a class="doc-anchor" href="#key-features">§</a>Key Features</h3>
+<ul>
+<li><strong>AES-256-GCM</strong>: Industry-standard authenticated encryption</li>
+<li><strong>Per-User KEKs</strong>: Each user has their own isolated KEK</li>
+<li><strong>KEK Rotation</strong>: Rotate individual KEKs or all KEKs in bulk</li>
+<li><strong>Version Tracking</strong>: Maintain backward compatibility with old KEKs</li>
+<li><strong>PostgreSQL Storage</strong>: Production-ready persistent storage</li>
+<li><strong>Zero-copy Security</strong>: Keys are zeroized from memory when dropped</li>
+</ul>
+<h3 id="modules"><a class="doc-anchor" href="#modules">§</a>Modules</h3>
+<ul>
+<li><a href="crypto/index.html" title="mod envelope_encryption::crypto"><code>crypto</code></a> - AES-256-GCM encryption primitives</li>
+<li><a href="postgres_storage/index.html" title="mod envelope_encryption::postgres_storage"><code>postgres_storage</code></a> - PostgreSQL storage backend for KEKs</li>
+<li><a href="postgres_envelope/index.html" title="mod envelope_encryption::postgres_envelope"><code>postgres_envelope</code></a> - High-level envelope encryption service</li>
+<li><a href="error/index.html" title="mod envelope_encryption::error"><code>error</code></a> - Error types and Result aliases</li>
+</ul>
+<h3 id="core-types"><a class="doc-anchor" href="#core-types">§</a>Core Types</h3><h4 id="service-types"><a class="doc-anchor" href="#service-types">§</a>Service Types</h4>
+<ul>
+<li><a href="postgres_envelope/struct.PostgresEnvelopeService.html" title="struct envelope_encryption::postgres_envelope::PostgresEnvelopeService"><code>PostgresEnvelopeService</code></a> - Main service for envelope encryption operations</li>
+<li><a href="postgres_storage/struct.PostgresStorage.html" title="struct envelope_encryption::postgres_storage::PostgresStorage"><code>PostgresStorage</code></a> - PostgreSQL storage backend</li>
+</ul>
+<h4 id="data-types"><a class="doc-anchor" href="#data-types">§</a>Data Types</h4>
+<ul>
+<li><a href="postgres_envelope/struct.GeneratedDek.html" title="struct envelope_encryption::postgres_envelope::GeneratedDek"><code>GeneratedDek</code></a> - Result of DEK generation with EDEK blob</li>
+<li><a href="postgres_storage/struct.StoredKek.html" title="struct envelope_encryption::postgres_storage::StoredKek"><code>StoredKek</code></a> - KEK stored in database with metadata</li>
+<li><a href="postgres_storage/enum.KekStatus.html" title="enum envelope_encryption::postgres_storage::KekStatus"><code>KekStatus</code></a> - KEK lifecycle status (Active, Retired, Disabled)</li>
+</ul>
+<h4 id="result-types"><a class="doc-anchor" href="#result-types">§</a>Result Types</h4>
+<ul>
+<li><a href="postgres_envelope/struct.BulkRotationResult.html" title="struct envelope_encryption::postgres_envelope::BulkRotationResult"><code>BulkRotationResult</code></a> - Result of bulk KEK rotation</li>
+<li><a href="postgres_envelope/struct.UserKekRotationResult.html" title="struct envelope_encryption::postgres_envelope::UserKekRotationResult"><code>UserKekRotationResult</code></a> - Result of single user KEK rotation</li>
+</ul>
+<h4 id="crypto-types"><a class="doc-anchor" href="#crypto-types">§</a>Crypto Types</h4>
+<ul>
+<li><a href="crypto/struct.AesGcmCipher.html" title="struct envelope_encryption::crypto::AesGcmCipher"><code>AesGcmCipher</code></a> - AES-256-GCM encryption/decryption</li>
+<li><a href="crypto/struct.SecureKey.html" title="struct envelope_encryption::crypto::SecureKey"><code>SecureKey</code></a> - Secure key wrapper with automatic zeroization</li>
+<li><a href="crypto/struct.EncryptedData.html" title="struct envelope_encryption::crypto::EncryptedData"><code>EncryptedData</code></a> - Encrypted data with nonce and authentication tag</li>
+</ul>
+<h3 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h3><h4 id="basic-encryptiondecryption"><a class="doc-anchor" href="#basic-encryptiondecryption">§</a>Basic Encryption/Decryption</h4>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>envelope_encryption::{PostgresEnvelopeService, AesGcmCipher};
+<span class="kw">use </span>uuid::Uuid;
+
+<span class="kw">let </span>user_id = Uuid::new_v4();
+
+<span class="comment">// Generate DEK (creates KEK automatically if needed)
+</span><span class="kw">let </span>dek = service.generate_dek(<span class="kw-2">&amp;</span>user_id).<span class="kw">await</span><span class="question-mark">?</span>;
+
+<span class="comment">// Encrypt data
+</span><span class="kw">let </span>plaintext = <span class="string">b"Secret message"</span>;
+<span class="kw">let </span>encrypted = AesGcmCipher::encrypt(<span class="kw-2">&amp;</span>dek.dek, plaintext, <span class="prelude-val">None</span>)<span class="question-mark">?</span>;
+
+<span class="comment">// Later: decrypt data
+</span><span class="kw">let </span>recovered_dek = service.decrypt_edek(
+    <span class="kw-2">&amp;</span>dek.dek_id,
+    <span class="kw-2">&amp;</span>dek.edek_blob,
+    <span class="kw-2">&amp;</span>user_id,
+    dek.kek_version
+).<span class="kw">await</span><span class="question-mark">?</span>;
+<span class="kw">let </span>decrypted = AesGcmCipher::decrypt(<span class="kw-2">&amp;</span>recovered_dek, <span class="kw-2">&amp;</span>encrypted, <span class="prelude-val">None</span>)<span class="question-mark">?</span>;
+<span class="macro">assert_eq!</span>(plaintext, <span class="kw-2">&amp;</span>decrypted[..]);</code></pre></div><h4 id="kek-rotation"><a class="doc-anchor" href="#kek-rotation">§</a>KEK Rotation</h4>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>envelope_encryption::{PostgresEnvelopeService, UserKekRotationResult};
+<span class="kw">use </span>uuid::Uuid;
+
+<span class="kw">let </span>user_id = Uuid::new_v4();
+
+<span class="comment">// Rotate a specific user's KEK
+</span><span class="kw">let </span>result = service.rotate_user_kek(<span class="kw-2">&amp;</span>user_id).<span class="kw">await</span><span class="question-mark">?</span>;
+<span class="macro">println!</span>(<span class="string">"Rotated KEK: v{} -&gt; v{}"</span>, result.old_version, result.new_version);
+
+<span class="comment">// Or rotate all KEKs in bulk
+</span><span class="kw">let </span>bulk_result = service.bulk_rotate_all_keks().<span class="kw">await</span><span class="question-mark">?</span>;
+<span class="macro">println!</span>(<span class="string">"Rotated {} KEKs"</span>, bulk_result.keks_rotated);</code></pre></div><h4 id="kek-lifecycle-management"><a class="doc-anchor" href="#kek-lifecycle-management">§</a>KEK Lifecycle Management</h4>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>envelope_encryption::PostgresEnvelopeService;
+<span class="kw">use </span>uuid::Uuid;
+
+<span class="kw">let </span>user_id = Uuid::new_v4();
+<span class="kw">let </span>old_version = <span class="number">1</span>;
+
+<span class="comment">// Disable a RETIRED KEK
+</span>service.disable_kek(<span class="kw-2">&amp;</span>user_id, old_version).<span class="kw">await</span><span class="question-mark">?</span>;
+
+<span class="comment">// Delete a DISABLED KEK
+</span>service.delete_kek(<span class="kw-2">&amp;</span>user_id, old_version).<span class="kw">await</span><span class="question-mark">?</span>;
+
+<span class="comment">// Monitor KEK statistics
+</span><span class="kw">let </span>stats = service.get_kek_stats().<span class="kw">await</span><span class="question-mark">?</span>;
+<span class="kw">for </span>(status, count) <span class="kw">in </span>stats {
+    <span class="macro">println!</span>(<span class="string">"{}: {}"</span>, status, count);
+}</code></pre></div></div></details><h2 id="reexports" class="section-header">Re-exports<a href="#reexports" class="anchor">§</a></h2><dl class="item-table reexports"><dt id="reexport.AesGcmCipher"><code>pub use crypto::<a class="struct" href="crypto/struct.AesGcmCipher.html" title="struct envelope_encryption::crypto::AesGcmCipher">AesGcmCipher</a>;</code></dt><dt id="reexport.EncryptedData"><code>pub use crypto::<a class="struct" href="crypto/struct.EncryptedData.html" title="struct envelope_encryption::crypto::EncryptedData">EncryptedData</a>;</code></dt><dt id="reexport.SecureKey"><code>pub use crypto::<a class="struct" href="crypto/struct.SecureKey.html" title="struct envelope_encryption::crypto::SecureKey">SecureKey</a>;</code></dt><dt id="reexport.AES_256_KEY_SIZE"><code>pub use crypto::<a class="constant" href="crypto/constant.AES_256_KEY_SIZE.html" title="constant envelope_encryption::crypto::AES_256_KEY_SIZE">AES_256_KEY_SIZE</a>;</code></dt><dt id="reexport.NONCE_SIZE"><code>pub use crypto::<a class="constant" href="crypto/constant.NONCE_SIZE.html" title="constant envelope_encryption::crypto::NONCE_SIZE">NONCE_SIZE</a>;</code></dt><dt id="reexport.EnvelopeError"><code>pub use error::<a class="enum" href="error/enum.EnvelopeError.html" title="enum envelope_encryption::error::EnvelopeError">EnvelopeError</a>;</code></dt><dt id="reexport.Result"><code>pub use error::<a class="type" href="error/type.Result.html" title="type envelope_encryption::error::Result">Result</a>;</code></dt><dt id="reexport.KeyStorage"><code>pub use storage::<a class="trait" href="storage/trait.KeyStorage.html" title="trait envelope_encryption::storage::KeyStorage">KeyStorage</a>;</code></dt><dt id="reexport.InMemoryStorage"><code>pub use storage::<a class="struct" href="storage/struct.InMemoryStorage.html" title="struct envelope_encryption::storage::InMemoryStorage">InMemoryStorage</a>;</code></dt><dt id="reexport.KeyMetadata"><code>pub use storage::<a class="struct" href="storage/struct.KeyMetadata.html" title="struct envelope_encryption::storage::KeyMetadata">KeyMetadata</a>;</code></dt><dt id="reexport.KeyType"><code>pub use storage::<a class="enum" href="storage/enum.KeyType.html" title="enum envelope_encryption::storage::KeyType">KeyType</a>;</code></dt><dt id="reexport.StoredKey"><code>pub use storage::<a class="struct" href="storage/struct.StoredKey.html" title="struct envelope_encryption::storage::StoredKey">StoredKey</a>;</code></dt><dt id="reexport.EncryptedRecord"><code>pub use storage::<a class="struct" href="storage/struct.EncryptedRecord.html" title="struct envelope_encryption::storage::EncryptedRecord">EncryptedRecord</a>;</code></dt><dt id="reexport.KeyManager"><code>pub use key_manager::<a class="struct" href="key_manager/struct.KeyManager.html" title="struct envelope_encryption::key_manager::KeyManager">KeyManager</a>;</code></dt><dt id="reexport.DekInfo"><code>pub use key_manager::<a class="struct" href="key_manager/struct.DekInfo.html" title="struct envelope_encryption::key_manager::DekInfo">DekInfo</a>;</code></dt><dt id="reexport.UserKekInfo"><code>pub use key_manager::<a class="struct" href="key_manager/struct.UserKekInfo.html" title="struct envelope_encryption::key_manager::UserKekInfo">UserKekInfo</a>;</code></dt><dt id="reexport.RotationResult"><code>pub use key_manager::<a class="struct" href="key_manager/struct.RotationResult.html" title="struct envelope_encryption::key_manager::RotationResult">RotationResult</a>;</code></dt><dt id="reexport.KeyStats"><code>pub use key_manager::<a class="struct" href="key_manager/struct.KeyStats.html" title="struct envelope_encryption::key_manager::KeyStats">KeyStats</a>;</code></dt><dt id="reexport.EnvelopeEncryption"><code>pub use envelope::<a class="struct" href="envelope/struct.EnvelopeEncryption.html" title="struct envelope_encryption::envelope::EnvelopeEncryption">EnvelopeEncryption</a>;</code></dt><dt id="reexport.EncryptedEnvelope"><code>pub use envelope::<a class="struct" href="envelope/struct.EncryptedEnvelope.html" title="struct envelope_encryption::envelope::EncryptedEnvelope">EncryptedEnvelope</a>;</code></dt><dt id="reexport.PostgresStorage"><code>pub use postgres_storage::<a class="struct" href="postgres_storage/struct.PostgresStorage.html" title="struct envelope_encryption::postgres_storage::PostgresStorage">PostgresStorage</a>;</code></dt><dt id="reexport.StoredKek"><code>pub use postgres_storage::<a class="struct" href="postgres_storage/struct.StoredKek.html" title="struct envelope_encryption::postgres_storage::StoredKek">StoredKek</a>;</code></dt><dt id="reexport.KekStatus"><code>pub use postgres_storage::<a class="enum" href="postgres_storage/enum.KekStatus.html" title="enum envelope_encryption::postgres_storage::KekStatus">KekStatus</a>;</code></dt><dt id="reexport.PostgresEnvelopeService"><code>pub use postgres_envelope::<a class="struct" href="postgres_envelope/struct.PostgresEnvelopeService.html" title="struct envelope_encryption::postgres_envelope::PostgresEnvelopeService">PostgresEnvelopeService</a>;</code></dt><dt id="reexport.GeneratedDek"><code>pub use postgres_envelope::<a class="struct" href="postgres_envelope/struct.GeneratedDek.html" title="struct envelope_encryption::postgres_envelope::GeneratedDek">GeneratedDek</a>;</code></dt><dt id="reexport.BulkRotationResult"><code>pub use postgres_envelope::<a class="struct" href="postgres_envelope/struct.BulkRotationResult.html" title="struct envelope_encryption::postgres_envelope::BulkRotationResult">BulkRotationResult</a>;</code></dt><dt id="reexport.UserKekRotationResult"><code>pub use postgres_envelope::<a class="struct" href="postgres_envelope/struct.UserKekRotationResult.html" title="struct envelope_encryption::postgres_envelope::UserKekRotationResult">UserKekRotationResult</a>;</code></dt></dl><h2 id="modules-1" class="section-header">Modules<a href="#modules-1" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="crypto/index.html" title="mod envelope_encryption::crypto">crypto</a></dt><dt><a class="mod" href="envelope/index.html" title="mod envelope_encryption::envelope">envelope</a></dt><dt><a class="mod" href="error/index.html" title="mod envelope_encryption::error">error</a></dt><dt><a class="mod" href="key_manager/index.html" title="mod envelope_encryption::key_manager">key_<wbr>manager</a></dt><dt><a class="mod" href="postgres_envelope/index.html" title="mod envelope_encryption::postgres_envelope">postgres_<wbr>envelope</a></dt><dt><a class="mod" href="postgres_storage/index.html" title="mod envelope_encryption::postgres_storage">postgres_<wbr>storage</a></dt><dt><a class="mod" href="storage/index.html" title="mod envelope_encryption::storage">storage</a></dt></dl></section></div></main></body></html>

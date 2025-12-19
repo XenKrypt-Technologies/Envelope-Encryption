@@ -218,7 +218,7 @@ impl PostgresEnvelopeService {
                 let new_kek_bytes = generate_random_bytes(32);
 
                 // Rotate KEK
-                let new_version = self.storage.rotate_kek(
+                let _new_version = self.storage.rotate_kek(
                     &stored_kek.user_id,
                     stored_kek.version,
                     &new_kek_bytes
