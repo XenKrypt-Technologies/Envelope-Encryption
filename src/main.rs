@@ -220,13 +220,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("│  Demo 7: Final Statistics                                         │");
     println!("└{}┘", "─".repeat(68));
 
-    let cached_dek_count = service.get_cached_dek_count();
     let final_stats = service.get_kek_stats().await?;
 
-    println!("\n[MEMORY CACHE]");
-    println!("  - DEKs cached: {}", cached_dek_count);
-    println!("  - Purpose: Testing and performance");
-    println!("  - Lifetime: Process runtime only");
+    println!("\n[HSM-STYLE ARCHITECTURE]");
+    println!("  - Library manages: KEKs only");
+    println!("  - Application manages: DEKs and EDEKs");
+    println!("  - Purpose: Separation of concerns");
 
     println!("\n[DATABASE]");
     println!("  - KEK Statistics:");
@@ -237,9 +236,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - Encryption at rest: Database encryption");
 
     println!("\n[IMPORTANT]");
-    println!("  ⚠ DEKs are NEVER stored in database");
-    println!("  ⚠ EDEKs are NEVER stored in database");
-    println!("  ✓ Only KEKs persisted (encrypted at rest by database)");
+    println!("  ⚠ Library does NOT cache or store DEKs");
+    println!("  ⚠ Application manages DEK lifecycle (cache, store as EDEK)");
+    println!("  ✓ Only KEKs persisted in database (encrypted at rest)");
     println!("  ✓ Total users tested: {}", user_ids.len());
 
     // ========================================================================

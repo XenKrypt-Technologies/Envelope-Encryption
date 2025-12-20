@@ -276,6 +276,15 @@ for (status, count) in stats {
 
 ## Architecture
 
+### HSM-Style Design
+
+This library follows a Hardware Security Module (HSM) style architecture with **clear separation of concerns**:
+
+- **Library Responsibility**: KEK lifecycle management (create, rotate, disable, delete)
+- **Application Responsibility**: DEK and EDEK management (caching, storage, retrieval)
+
+This design ensures that the library acts as a secure key management service, while applications maintain full control over their data encryption workflow.
+
 ### Core Modules
 
 | Module | Description |
@@ -288,16 +297,16 @@ for (status, count) in stats {
 ### Storage Strategy
 
 - **KEKs**: Stored as plaintext (32 bytes) in PostgreSQL, encrypted at rest by database encryption
-- **DEKs**: In-memory only, never persisted to database
-- **EDEKs**: Application-managed, can be stored with encrypted data
+- **DEKs**: Ephemeral, generated on-demand by library, managed by application
+- **EDEKs**: Application-managed, stored with encrypted data by application
 
 ### Key Types
 
 | Key Type | Size | Lifetime | Rotation | Storage |
 |----------|------|----------|----------|---------|
-| **KEK** | 32 bytes | Per-user, versioned | Manual via API | PostgreSQL `user_keks` table |
-| **DEK** | 32 bytes | One-time use | Not needed | In-memory only |
-| **EDEK** | 60 bytes | Tied to data | Via KEK rotation | Application-managed |
+| **KEK** | 32 bytes | Per-user, versioned | Manual via API | PostgreSQL `user_keks` table (library) |
+| **DEK** | 32 bytes | One-time use | Not needed | Application-managed (ephemeral/cached) |
+| **EDEK** | 60 bytes | Tied to data | Via KEK rotation | Application-managed (with encrypted data) |
 
 ### EDEK Format (AEAD)
 

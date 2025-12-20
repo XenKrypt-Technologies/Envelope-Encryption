@@ -62,7 +62,13 @@ pub async fn generate_dek(&self, user_id: &Uuid) -> Result<GeneratedDek>
 **Behavior:**
 - Creates user's first KEK (version 1) if it doesn't exist
 - Performs lazy rotation if user's KEK is RETIRED
-- Returns DEK encrypted with user's ACTIVE KEK
+- Returns ephemeral DEK encrypted with user's ACTIVE KEK
+- **Application is responsible for DEK lifecycle management** (caching, storing EDEK blobs)
+
+**Important:** The library follows an HSM-style architecture:
+- Library manages KEKs (create, rotate, disable, delete)
+- Application manages DEKs and EDEKs (cache, store, retrieve)
+- This separation ensures clear responsibility boundaries
 
 **Example:**
 ```rust
@@ -74,6 +80,9 @@ let dek = service.generate_dek(&user_id).await?;
 println!("DEK ID: {}", dek.dek_id);
 println!("KEK Version: {}", dek.kek_version);
 println!("EDEK Blob: {} bytes", dek.edek_blob.len());
+
+// Application should store dek.edek_blob and dek.kek_version
+// for later decryption, and manage DEK caching as needed
 ```
 
 ### `decrypt_edek`
@@ -102,22 +111,28 @@ pub async fn decrypt_edek(
 **Behavior:**
 - Retrieves the specified KEK version from storage
 - **Decrypts EDEK using the ORIGINAL KEK** (the one specified by `kek_version`)
-- If KEK is RETIRED, logs intent for lazy rotation (rotation would happen after decryption)
+- If KEK is RETIRED, logs recommendation for lazy rotation
 - Returns the decrypted DEK
+- **Application is responsible for DEK caching**
 
-**Important:** Lazy rotation (if implemented) happens AFTER successful decryption because:
+**Important:** Lazy rotation happens AFTER successful decryption because:
 - The EDEK was encrypted with the OLD KEK specified by `kek_version`
 - Decryption MUST use the SAME KEK that was used for encryption
 - Only after successful decryption can the DEK be re-encrypted with a new ACTIVE KEK
+- If KEK is RETIRED, application should call `generate_dek()` to get a new EDEK with the latest KEK
 
 **Example:**
 ```rust
+// Decrypt with the original KEK version
 let recovered_dek = service.decrypt_edek(
     &dek.dek_id,
     &dek.edek_blob,
     &user_id,
     dek.kek_version
 ).await?;
+
+// Application can cache this DEK as needed
+// If using a RETIRED KEK, consider re-encrypting with generate_dek()
 ```
 
 ---
@@ -271,23 +286,6 @@ for (status, count) in stats {
 // ACTIVE: 125
 // RETIRED: 50
 // DISABLED: 10
-```
-
-### `get_cached_dek_count`
-
-Get count of cached DEKs in memory (for testing).
-
-```rust
-pub fn get_cached_dek_count(&self) -> usize
-```
-
-**Returns:**
-- `usize` - Number of DEKs cached in memory
-
-**Example:**
-```rust
-let count = service.get_cached_dek_count();
-println!("Cached DEKs: {}", count);
 ```
 
 ---

@@ -1,8 +1,5 @@
 use uuid::Uuid;
 use chrono::Utc;
-use std::collections::HashMap;
-use std::sync::Arc;
-use parking_lot::RwLock;
 
 use crate::crypto::{AesGcmCipher, EncryptedData, SecureKey, generate_random_bytes};
 use crate::error::{EnvelopeError, Result};
@@ -16,8 +13,13 @@ use crate::postgres_storage::{PostgresStorage, StoredKek, KekStatus};
 ///
 /// Key hierarchy:
 /// - Database Encryption → KEK (plaintext in DB, encrypted at rest by database)
-/// - KEK → DEK (in-memory only)
+/// - KEK → DEK (ephemeral, managed by application)
 /// - DEK → Application Data
+///
+/// HSM-style design:
+/// - Library manages KEK lifecycle (create, rotate, disable, delete)
+/// - Application manages DEK caching/storage (as EDEK blobs)
+/// - Crypto primitives provided for DEK encryption/decryption
 ///
 /// Rotation strategy:
 /// 1. Mark all ACTIVE KEKs as RETIRED
@@ -26,8 +28,6 @@ use crate::postgres_storage::{PostgresStorage, StoredKek, KekStatus};
 /// 4. Only ACTIVE KEK used for encryption, old KEKs for decryption only
 pub struct PostgresEnvelopeService {
     storage: PostgresStorage,
-    // In-memory cache for testing: Maps dek_id → (DEK, EDEK, user_id, kek_version)
-    dek_cache: Arc<RwLock<HashMap<Uuid, CachedDek>>>,
 }
 
 impl PostgresEnvelopeService {
@@ -38,22 +38,18 @@ impl PostgresEnvelopeService {
         println!("[INIT] ✓ KEKs stored as plaintext (32 bytes) in database");
         println!("[INIT] ✓ PostgresEnvelopeService initialized successfully\n");
 
-        Ok(Self {
-            storage,
-            dek_cache: Arc::new(RwLock::new(HashMap::new())),
-        })
+        Ok(Self { storage })
     }
 
     /// API: generate_dek(user_id) -> (dek, edek, kek_version)
     ///
     /// Crypto flow:
     /// 1. Get or create ACTIVE KEK for user (plaintext from DB, encrypted at rest by database)
-    /// 2. Generate fresh DEK (random 32 bytes, in memory)
-    /// 3. Encrypt DEK using KEK with AES-GCM (AAD = dek_id) → EDEK (in memory)
-    /// 4. Cache DEK + EDEK in memory for testing purposes
-    /// 5. Return (dek, edek_blob, kek_version)
+    /// 2. Generate fresh DEK (random 32 bytes, ephemeral)
+    /// 3. Encrypt DEK using KEK with AES-GCM (AAD = dek_id) → EDEK
+    /// 4. Return (dek_id, dek, edek_blob, kek_version)
     ///
-    /// Note: DEK and EDEK are NEVER stored in database, only in memory cache
+    /// Note: Application is responsible for caching DEK or storing EDEK blob
     pub async fn generate_dek(&self, user_id: &Uuid) -> Result<GeneratedDek> {
         println!("\n[GENERATE_DEK] Starting DEK generation for user: {}", user_id);
 
@@ -74,13 +70,13 @@ impl PostgresEnvelopeService {
     }
 
     /// Internal: Generate DEK with a specific KEK
-    async fn generate_dek_with_kek(&self, user_id: &Uuid, kek_info: KekInfo) -> Result<GeneratedDek> {
-        // Step 2: Generate fresh DEK (random 32 bytes, in memory only)
-        println!("[GENERATE_DEK] Step 2: Generating fresh DEK (32 bytes, in-memory)...");
+    async fn generate_dek_with_kek(&self, _user_id: &Uuid, kek_info: KekInfo) -> Result<GeneratedDek> {
+        // Step 2: Generate fresh DEK (random 32 bytes, ephemeral)
+        println!("[GENERATE_DEK] Step 2: Generating fresh DEK (32 bytes, ephemeral)...");
         let dek = SecureKey::generate();
         let dek_id = Uuid::new_v4();
         println!("[GENERATE_DEK] ✓ DEK generated (ID: {})", dek_id);
-        println!("[GENERATE_DEK] ⚠ DEK is in-memory ONLY, NOT stored in database");
+        println!("[GENERATE_DEK] ⚠ DEK management is application's responsibility");
 
         // Step 3: Encrypt DEK with user's KEK (AAD = dek_id for binding)
         println!("[GENERATE_DEK] Step 3: Encrypting DEK with KEK (AAD=dek_id)...");
@@ -89,22 +85,6 @@ impl PostgresEnvelopeService {
         // Convert to AEAD blob format (nonce || ciphertext || tag)
         let edek_blob = edek.to_aead_blob();
         println!("[GENERATE_DEK] ✓ EDEK created (AEAD blob: {} bytes)", edek_blob.len());
-
-        // Step 4: Cache DEK + EDEK in memory for testing (NOT in database)
-        println!("[GENERATE_DEK] Step 4: Caching DEK+EDEK in memory (testing only)...");
-        self.dek_cache.write().insert(
-            dek_id,
-            CachedDek {
-                dek: dek.clone(),
-                edek_blob: edek_blob.clone(),
-                user_id: *user_id,
-                kek_version: kek_info.version,
-                created_at: Utc::now(),
-            },
-        );
-        let cache_size = self.dek_cache.read().len();
-        println!("[GENERATE_DEK] ✓ Cached in memory (total cached DEKs: {})", cache_size);
-        println!("[GENERATE_DEK] ⚠ EDEK is in-memory ONLY, NOT stored in database");
         println!("[GENERATE_DEK] ✓ DEK generation complete\n");
 
         Ok(GeneratedDek {
@@ -118,11 +98,10 @@ impl PostgresEnvelopeService {
     /// API: decrypt_edek(dek_id, edek_blob, user_id, kek_version) -> dek
     ///
     /// Crypto flow:
-    /// 1. Try to get from in-memory cache first (for testing)
-    /// 2. If not cached, fetch KEK from database by (user_id, kek_version)
-    /// 3. Decrypt EDEK using the ORIGINAL KEK (AAD = dek_id) → DEK (in memory)
-    /// 4. If KEK is RETIRED, perform lazy rotation (note: rotation happens AFTER decryption)
-    /// 5. Return DEK
+    /// 1. Fetch KEK from database by (user_id, kek_version)
+    /// 2. Decrypt EDEK using the ORIGINAL KEK (AAD = dek_id) → DEK
+    /// 3. If KEK is RETIRED, log intent for lazy rotation (rotation happens after decryption)
+    /// 4. Return DEK
     ///
     /// IMPORTANT: Lazy rotation happens AFTER decryption because:
     /// - EDEK was encrypted with the OLD KEK (specified by kek_version)
@@ -140,37 +119,23 @@ impl PostgresEnvelopeService {
         println!("[DECRYPT_EDEK] KEK version: {}", kek_version);
         println!("[DECRYPT_EDEK] EDEK blob: {} bytes", edek_blob.len());
 
-        // Step 1: Try to get from cache (for testing)
-        println!("[DECRYPT_EDEK] Step 1: Checking in-memory cache...");
-        if let Some(cached) = self.dek_cache.read().get(dek_id) {
-            println!("[DECRYPT_EDEK] ✓ Found DEK in cache!");
-            println!("[DECRYPT_EDEK] ✓ Returning cached DEK (no database access needed)\n");
-            return Ok(cached.dek.clone());
-        }
-        println!("[DECRYPT_EDEK] ✗ Not in cache, will decrypt from EDEK");
-
-        // Step 2: Get user's KEK for this version
-        println!("[DECRYPT_EDEK] Step 2: Fetching KEK from database (version: {})...", kek_version);
+        // Step 1: Get user's KEK for this version
+        println!("[DECRYPT_EDEK] Step 1: Fetching KEK from database (version: {})...", kek_version);
         let kek_info = self.get_kek_by_version(user_id, kek_version).await?;
         println!("[DECRYPT_EDEK] ✓ KEK retrieved (status: {:?})", kek_info.status);
 
-        // Step 3: Decrypt EDEK using the ORIGINAL KEK (CRITICAL: must use same KEK that encrypted it)
-        println!("[DECRYPT_EDEK] Step 3: Decrypting EDEK with KEK version {} (AAD=dek_id)...", kek_version);
+        // Step 2: Decrypt EDEK using the ORIGINAL KEK (CRITICAL: must use same KEK that encrypted it)
+        println!("[DECRYPT_EDEK] Step 2: Decrypting EDEK with KEK version {} (AAD=dek_id)...", kek_version);
         let edek = EncryptedData::from_aead_blob(edek_blob)?;
         let dek_bytes = AesGcmCipher::decrypt(&kek_info.kek, &edek, Some(dek_id.as_bytes()))?;
-        println!("[DECRYPT_EDEK] ✓ DEK decrypted successfully (32 bytes, in-memory)");
-        println!("[DECRYPT_EDEK] ⚠ DEK is in-memory ONLY, NOT stored in database");
+        println!("[DECRYPT_EDEK] ✓ DEK decrypted successfully (32 bytes)");
+        println!("[DECRYPT_EDEK] ⚠ DEK management is application's responsibility");
 
-        // Step 4: If KEK is RETIRED, perform lazy rotation (after successful decryption)
+        // Step 3: If KEK is RETIRED, log intent for lazy rotation (after successful decryption)
         if kek_info.status == KekStatus::Retired {
-            println!("[DECRYPT_EDEK] ⚠ KEK is RETIRED, performing lazy rotation...");
-            println!("[DECRYPT_EDEK] ℹ Note: Lazy rotation would re-encrypt DEK with new ACTIVE KEK");
-            println!("[DECRYPT_EDEK] ℹ Note: Caller should update EDEK blob and kek_version in storage");
-            // TODO: Implement re-encryption and return new EDEK + new kek_version
-            // For now, we just log the intent. A full implementation would:
-            // 1. Get or create new ACTIVE KEK
-            // 2. Re-encrypt DEK with new KEK
-            // 3. Return (DEK, new_edek_blob, new_kek_version) so caller can update storage
+            println!("[DECRYPT_EDEK] ⚠ KEK is RETIRED (lazy rotation recommended)");
+            println!("[DECRYPT_EDEK] ℹ Note: Application should re-encrypt DEK with new ACTIVE KEK");
+            println!("[DECRYPT_EDEK] ℹ Note: Call generate_dek() to get new EDEK with latest KEK");
         }
 
         println!("[DECRYPT_EDEK] ✓ EDEK decryption complete\n");
@@ -331,16 +296,6 @@ impl PostgresEnvelopeService {
         self.storage.get_kek_stats().await
     }
 
-    /// Get cached DEK count (in-memory only, for testing)
-    pub fn get_cached_dek_count(&self) -> usize {
-        self.dek_cache.read().len()
-    }
-
-    /// Clear DEK cache (for testing)
-    pub fn clear_dek_cache(&self) {
-        self.dek_cache.write().clear()
-    }
-
     /// Internal: Get or create user's ACTIVE KEK
     async fn get_or_create_user_kek(&self, user_id: &Uuid) -> Result<KekInfo> {
         println!("[GET_OR_CREATE_KEK] Checking database for existing KEK (user: {})...", user_id);
@@ -461,18 +416,4 @@ struct KekInfo {
     version: i64,
     kek: SecureKey,
     status: KekStatus,
-}
-
-/// Cached DEK info (in-memory only, for testing)
-#[derive(Debug, Clone)]
-struct CachedDek {
-    dek: SecureKey,
-    #[allow(dead_code)]
-    edek_blob: Vec<u8>,  // AEAD format: nonce || ciphertext || tag
-    #[allow(dead_code)]
-    user_id: Uuid,
-    #[allow(dead_code)]
-    kek_version: i64,
-    #[allow(dead_code)]
-    created_at: chrono::DateTime<chrono::Utc>,
 }
