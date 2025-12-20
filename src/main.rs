@@ -6,7 +6,6 @@
 /// PostgreSQL setup:
 ///   1. Run schema: psql -U postgres -f schema.sql
 ///   2. Ensure .env has DATABASE_URL
-
 use envelope_encryption::{PostgresStorage, PostgresEnvelopeService, AesGcmCipher};
 use sqlx::PgPool;
 use uuid::Uuid;

@@ -1,6 +1,7 @@
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use std::str::FromStr;
 
 use crate::error::{EnvelopeError, Result};
 
@@ -84,7 +85,7 @@ impl PostgresStorage {
             VALUES ($1, $2, $3, $4::key_status, $5)
             "#
         )
-        .bind(&kek.user_id)
+        .bind(kek.user_id)
         .bind(kek.version)
         .bind(&kek.kek_plaintext)
         .bind(kek.status.to_str())
@@ -222,8 +223,12 @@ impl KekStatus {
             KekStatus::Disabled => "DISABLED",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Result<Self> {
+impl FromStr for KekStatus {
+    type Err = EnvelopeError;
+
+    fn from_str(s: &str) -> Result<Self> {
         match s {
             "ACTIVE" => Ok(KekStatus::Active),
             "RETIRED" => Ok(KekStatus::Retired),
