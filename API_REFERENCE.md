@@ -574,4 +574,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [README.md](README.md) - Project overview and setup
 - [QUICKSTART.md](QUICKSTART.md) - Quick start guide
 - [schema.sql](schema.sql) - Database schema
-- [Documentation](doc/index.html) - Program docs
+- [Documentation](target/doc/envelope_encryption/index.html) - Program docs
