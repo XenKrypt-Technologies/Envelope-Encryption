@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["KeyType"],"struct":["EncryptedRecord","InMemoryStorage","KeyMetadata","StoredKey"],"trait":["KeyStorage"]};

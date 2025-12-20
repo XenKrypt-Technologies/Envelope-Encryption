@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["AES_256_KEY_SIZE","NONCE_SIZE","TAG_SIZE"],"fn":["generate_random_bytes"],"struct":["AesGcmCipher","EncryptedData","SecureKey"]};
