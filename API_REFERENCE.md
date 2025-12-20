@@ -101,8 +101,14 @@ pub async fn decrypt_edek(
 
 **Behavior:**
 - Retrieves the specified KEK version from storage
-- Performs lazy rotation if the KEK is RETIRED
-- Decrypts and returns the DEK
+- **Decrypts EDEK using the ORIGINAL KEK** (the one specified by `kek_version`)
+- If KEK is RETIRED, logs intent for lazy rotation (rotation would happen after decryption)
+- Returns the decrypted DEK
+
+**Important:** Lazy rotation (if implemented) happens AFTER successful decryption because:
+- The EDEK was encrypted with the OLD KEK specified by `kek_version`
+- Decryption MUST use the SAME KEK that was used for encryption
+- Only after successful decryption can the DEK be re-encrypted with a new ACTIVE KEK
 
 **Example:**
 ```rust

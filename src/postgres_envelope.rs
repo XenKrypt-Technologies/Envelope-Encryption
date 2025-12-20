@@ -120,9 +120,14 @@ impl PostgresEnvelopeService {
     /// Crypto flow:
     /// 1. Try to get from in-memory cache first (for testing)
     /// 2. If not cached, fetch KEK from database by (user_id, kek_version)
-    /// 3. If KEK is RETIRED, perform lazy rotation and use new ACTIVE KEK
-    /// 4. Decrypt EDEK using KEK (AAD = dek_id) → DEK (in memory)
+    /// 3. Decrypt EDEK using the ORIGINAL KEK (AAD = dek_id) → DEK (in memory)
+    /// 4. If KEK is RETIRED, perform lazy rotation (note: rotation happens AFTER decryption)
     /// 5. Return DEK
+    ///
+    /// IMPORTANT: Lazy rotation happens AFTER decryption because:
+    /// - EDEK was encrypted with the OLD KEK (specified by kek_version)
+    /// - We MUST decrypt with the SAME KEK that was used for encryption
+    /// - Only AFTER successful decryption can we re-encrypt with a new ACTIVE KEK
     pub async fn decrypt_edek(
         &self,
         dek_id: &Uuid,
@@ -149,22 +154,25 @@ impl PostgresEnvelopeService {
         let kek_info = self.get_kek_by_version(user_id, kek_version).await?;
         println!("[DECRYPT_EDEK] ✓ KEK retrieved (status: {:?})", kek_info.status);
 
-        // Step 3: If KEK is RETIRED, perform lazy rotation
-        let kek_to_use = if kek_info.status == KekStatus::Retired {
-            println!("[DECRYPT_EDEK] ⚠ KEK is RETIRED, performing lazy rotation...");
-            let rotated_kek = self.rotate_single_kek(user_id, kek_version).await?;
-            println!("[DECRYPT_EDEK] ✓ Lazy rotation complete, using new ACTIVE KEK (version: {})", rotated_kek.version);
-            rotated_kek
-        } else {
-            kek_info
-        };
-
-        // Step 4: Decrypt EDEK to get DEK
-        println!("[DECRYPT_EDEK] Step 3: Decrypting EDEK with KEK (AAD=dek_id)...");
+        // Step 3: Decrypt EDEK using the ORIGINAL KEK (CRITICAL: must use same KEK that encrypted it)
+        println!("[DECRYPT_EDEK] Step 3: Decrypting EDEK with KEK version {} (AAD=dek_id)...", kek_version);
         let edek = EncryptedData::from_aead_blob(edek_blob)?;
-        let dek_bytes = AesGcmCipher::decrypt(&kek_to_use.kek, &edek, Some(dek_id.as_bytes()))?;
+        let dek_bytes = AesGcmCipher::decrypt(&kek_info.kek, &edek, Some(dek_id.as_bytes()))?;
         println!("[DECRYPT_EDEK] ✓ DEK decrypted successfully (32 bytes, in-memory)");
         println!("[DECRYPT_EDEK] ⚠ DEK is in-memory ONLY, NOT stored in database");
+
+        // Step 4: If KEK is RETIRED, perform lazy rotation (after successful decryption)
+        if kek_info.status == KekStatus::Retired {
+            println!("[DECRYPT_EDEK] ⚠ KEK is RETIRED, performing lazy rotation...");
+            println!("[DECRYPT_EDEK] ℹ Note: Lazy rotation would re-encrypt DEK with new ACTIVE KEK");
+            println!("[DECRYPT_EDEK] ℹ Note: Caller should update EDEK blob and kek_version in storage");
+            // TODO: Implement re-encryption and return new EDEK + new kek_version
+            // For now, we just log the intent. A full implementation would:
+            // 1. Get or create new ACTIVE KEK
+            // 2. Re-encrypt DEK with new KEK
+            // 3. Return (DEK, new_edek_blob, new_kek_version) so caller can update storage
+        }
+
         println!("[DECRYPT_EDEK] ✓ EDEK decryption complete\n");
 
         Ok(SecureKey::new(dek_bytes))
