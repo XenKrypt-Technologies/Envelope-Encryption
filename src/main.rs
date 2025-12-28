@@ -9,266 +9,260 @@
 use envelope_encryption::{PostgresStorage, PostgresEnvelopeService, AesGcmCipher};
 use sqlx::PgPool;
 use uuid::Uuid;
+use std::time::Instant;
+use std::io::{self, Write};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Envelope Encryption Demo ===\n");
+    println!("=== Envelope Encryption Benchmark ===\n");
 
     // Load environment variables
-    println!("[STARTUP] Loading .env file...");
     dotenvy::dotenv().ok();
-
-    // Get database URL
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set in .env");
 
-    println!("[STARTUP] Database URL: {}", database_url.split('@').next().unwrap_or("***"));
-    println!("[STARTUP] Connecting to PostgreSQL...\n");
-
     // Connect to PostgreSQL
     let pool = PgPool::connect(&database_url).await?;
-    println!("[STARTUP] ✓ PostgreSQL connection established\n");
 
-    // Initialize storage and service
-    println!("[STARTUP] Initializing PostgresEnvelopeService...");
-    let storage = PostgresStorage::new(pool);
-    let service = PostgresEnvelopeService::new(storage).await?;
-
-    println!("\n{}", "=".repeat(70));
-    println!("                    DEMO START");
-    println!("{}\n", "=".repeat(70));
-
-    // ========================================================================
-    // Demo 1: Create 125 users with KEKs
-    // ========================================================================
-    println!("┌{}┐", "─".repeat(68));
-    println!("│  Demo 1: Create 125 Users with KEKs                               │");
-    println!("└{}┘", "─".repeat(68));
-
-    let mut user_ids = Vec::new();
-    println!("\n[INFO] Creating 125 users...");
-
-    for i in 0..125 {
-        let user_id = Uuid::new_v4();
-        user_ids.push(user_id);
-
-        // Generate DEK to trigger KEK creation
-        let _ = service.generate_dek(&user_id).await?;
-
-        if (i + 1) % 25 == 0 {
-            println!("[INFO] Created {} users with KEKs", i + 1);
+    // Truncate tables on startup (if they exist)
+    let truncate_start = Instant::now();
+    match sqlx::query("TRUNCATE TABLE user_keks CASCADE").execute(&pool).await {
+        Ok(_) => {
+            let truncate_duration = truncate_start.elapsed();
+            println!("[STARTUP] Tables truncated in {:.3}ms", truncate_duration.as_secs_f64() * 1000.0);
+        }
+        Err(_) => {
+            println!("[STARTUP] Tables will be created automatically");
         }
     }
 
-    println!("\n[RESULT] ✓ Created 125 users with ACTIVE KEKs");
+    // Get test quantity from user
+    print!("Enter number of users to test (default: 125): ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let test_quantity: usize = input.trim().parse().unwrap_or(125);
+    println!("Testing with {} users\n", test_quantity);
 
-    // Check stats
-    let stats = service.get_kek_stats().await?;
-    println!("[RESULT] KEK Statistics:");
-    for (status, count) in &stats {
-        println!("[RESULT]   - {}: {}", status, count);
+    // Initialize storage and service
+    let storage = PostgresStorage::new(pool);
+    let service = PostgresEnvelopeService::new(storage).await?;
+
+    println!("{}", "=".repeat(70));
+    println!("                    BENCHMARK START");
+    println!("{}\n", "=".repeat(70));
+
+    // ========================================================================
+    // Demo 1: Create users with KEKs
+    // ========================================================================
+    println!("┌{}┐", "─".repeat(68));
+    println!("│  Demo 1: Create {} Users with KEKs{:>width$}│", test_quantity, "", width = 35 - test_quantity.to_string().len());
+    println!("└{}┘", "─".repeat(68));
+
+    let mut user_ids = Vec::new();
+
+    let demo1_start = Instant::now();
+    for i in 0..test_quantity {
+        let user_id = Uuid::new_v4();
+        user_ids.push(user_id);
+        let _ = service.generate_dek(&user_id).await?;
+
+        if (i + 1) % 25 == 0 || (i + 1) == test_quantity {
+            println!("  Progress: {}/{}", i + 1, test_quantity);
+        }
     }
+    let demo1_duration = demo1_start.elapsed();
+
+    println!("✓ Created {} users with ACTIVE KEKs", test_quantity);
+    println!("[PERF] Time: {:.3}ms | Rate: {:.2} ops/sec\n",
+        demo1_duration.as_secs_f64() * 1000.0,
+        test_quantity as f64 / demo1_duration.as_secs_f64());
 
     // ========================================================================
-    // Demo 2: Test basic encryption/decryption with first user
+    // Demo 2: Test basic encryption/decryption
     // ========================================================================
-    println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 2: Test Encryption/Decryption                               │");
+    println!("┌{}┐", "─".repeat(68));
+    println!("│  Demo 2: Encryption/Decryption Benchmark                          │");
     println!("└{}┘", "─".repeat(68));
 
     let test_user = user_ids[0];
-    println!("\n[INFO] Testing with user: {}", test_user);
-
     let user_dek = service.generate_dek(&test_user).await?;
     let plaintext = b"Sensitive data protected by envelope encryption";
     let content_id = Uuid::new_v4();
 
-    println!("[ENCRYPT] Encrypting data...");
+    let encrypt_start = Instant::now();
     let encrypted = AesGcmCipher::encrypt(&user_dek.dek, plaintext, Some(content_id.as_bytes()))?;
-    println!("[ENCRYPT] ✓ Ciphertext: {} bytes", encrypted.ciphertext.len());
+    let encrypt_time = encrypt_start.elapsed();
 
-    println!("[DECRYPT] Decrypting data...");
+    let decrypt_start = Instant::now();
     let recovered_dek = service.decrypt_edek(
         &user_dek.dek_id,
         &user_dek.edek_blob,
         &test_user,
         user_dek.kek_version
     ).await?;
-    let decrypted = AesGcmCipher::decrypt(&recovered_dek, &encrypted, Some(content_id.as_bytes()))?;
-    println!("[DECRYPT] ✓ Plaintext: {:?}", String::from_utf8_lossy(&decrypted));
+    let edek_decrypt_time = decrypt_start.elapsed();
+
+    let decrypt_data_start = Instant::now();
+    let _decrypted = AesGcmCipher::decrypt(&recovered_dek, &encrypted, Some(content_id.as_bytes()))?;
+    let data_decrypt_time = decrypt_data_start.elapsed();
+
+    println!("✓ Data encrypted/decrypted successfully");
+    println!("[PERF] Encryption:      {:.3}ms ({:.2} ops/sec)",
+        encrypt_time.as_secs_f64() * 1000.0, 1.0 / encrypt_time.as_secs_f64());
+    println!("[PERF] EDEK Decryption: {:.3}ms ({:.2} ops/sec)",
+        edek_decrypt_time.as_secs_f64() * 1000.0, 1.0 / edek_decrypt_time.as_secs_f64());
+    println!("[PERF] Data Decryption: {:.3}ms ({:.2} ops/sec)\n",
+        data_decrypt_time.as_secs_f64() * 1000.0, 1.0 / data_decrypt_time.as_secs_f64());
 
     // ========================================================================
-    // Demo 3: Bulk KEK Rotation (125 KEKs)
+    // Demo 3: Bulk KEK Rotation
     // ========================================================================
-    println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 3: Bulk KEK Rotation (125 KEKs in batches of 50)            │");
+    println!("┌{}┐", "─".repeat(68));
+    println!("│  Demo 3: Bulk KEK Rotation ({} KEKs){:>width$}│",
+        test_quantity, "", width = 40 - test_quantity.to_string().len());
     println!("└{}┘", "─".repeat(68));
 
-    println!("\n[INFO] Current KEK statistics:");
-    let stats_before = service.get_kek_stats().await?;
-    for (status, count) in &stats_before {
-        println!("[INFO]   - {}: {}", status, count);
-    }
-
-    println!("\n[INFO] Starting bulk rotation of 125 KEKs...");
-    println!("[INFO] This will rotate in batches of 50...");
-
+    let demo3_start = Instant::now();
     let rotation_result = service.bulk_rotate_all_keks().await?;
+    let demo3_duration = demo3_start.elapsed();
 
-    println!("\n[RESULT] Bulk Rotation Complete:");
-    println!("[RESULT]   - KEKs marked as RETIRED: {}", rotation_result.keks_marked_retired);
-    println!("[RESULT]   - KEKs rotated: {}", rotation_result.keks_rotated);
-
-    println!("\n[INFO] KEK statistics after rotation:");
-    let stats_after = service.get_kek_stats().await?;
-    for (status, count) in &stats_after {
-        println!("[INFO]   - {}: {}", status, count);
-    }
+    println!("✓ Bulk rotation complete");
+    println!("[PERF] Time: {:.3}ms | Rate: {:.2} ops/sec",
+        demo3_duration.as_secs_f64() * 1000.0,
+        rotation_result.keks_rotated as f64 / demo3_duration.as_secs_f64());
+    println!("[DEBUG] KEKs marked RETIRED: {}", rotation_result.keks_marked_retired);
+    println!("[DEBUG] KEKs rotated: {}\n", rotation_result.keks_rotated);
 
     // ========================================================================
     // Demo 4: Lazy Rotation - Random User Access
     // ========================================================================
-    println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 4: Lazy Rotation - Random User Access                       │");
+    println!("┌{}┐", "─".repeat(68));
+    println!("│  Demo 4: Lazy Rotation Test                                       │");
     println!("└{}┘", "─".repeat(68));
-
-    // After bulk rotation, all 125 users now have ACTIVE KEKs (version 2)
-    // Let's pick 5 random users and test that they can generate DEKs successfully
-    println!("\n[INFO] Testing KEK access after bulk rotation");
-    println!("[INFO] All users should have ACTIVE KEKs (version 2) after rotation");
 
     use rand::seq::SliceRandom;
     use rand::thread_rng;
 
     let mut rng = thread_rng();
-    let mut random_users: Vec<_> = user_ids.iter().take(10).cloned().collect();
+    let sample_size = std::cmp::min(10, test_quantity);
+    let mut random_users: Vec<_> = user_ids.iter().take(sample_size).cloned().collect();
     random_users.shuffle(&mut rng);
-    let random_users: Vec<_> = random_users.iter().take(5).cloned().collect();
+    let test_sample = std::cmp::min(5, random_users.len());
+    let random_users: Vec<_> = random_users.iter().take(test_sample).cloned().collect();
 
-    println!("\n[INFO] Testing with 5 random users from the 125:");
+    let demo4_start = Instant::now();
     for (idx, user_id) in random_users.iter().enumerate() {
-        println!("\n[INFO] User {} of 5: {}", idx + 1, user_id);
-
-        // Generate new DEK - should use the ACTIVE KEK (version 2 after rotation)
+        let user_start = Instant::now();
         let dek = service.generate_dek(user_id).await?;
-        println!("[INFO] ✓ DEK generated with KEK version: {}", dek.kek_version);
-        println!("[INFO] ✓ Using ACTIVE KEK (version {} after bulk rotation)", dek.kek_version);
-    }
+        let user_time = user_start.elapsed();
 
-    println!("\n[RESULT] ✓ All 5 users successfully generated DEKs");
-    println!("[RESULT] ✓ All are using ACTIVE KEKs (version 2)");
+        println!("  User {}/{}: KEK v{} | {:.3}ms ({:.2} ops/sec)",
+            idx + 1, test_sample, dek.kek_version,
+            user_time.as_secs_f64() * 1000.0,
+            1.0 / user_time.as_secs_f64());
+    }
+    let demo4_duration = demo4_start.elapsed();
+
+    println!("✓ All {} users successfully generated DEKs", test_sample);
+    println!("[PERF] Average: {:.3}ms per user\n",
+        demo4_duration.as_secs_f64() * 1000.0 / test_sample as f64);
 
     // ========================================================================
     // Demo 5: Verify Old KEKs Can Still Decrypt
     // ========================================================================
-    println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 5: Verify Old KEKs Can Still Decrypt                        │");
+    println!("┌{}┐", "─".repeat(68));
+    println!("│  Demo 5: Backward Compatibility Test                              │");
     println!("└{}┘", "─".repeat(68));
 
-    println!("\n[INFO] Testing that old RETIRED KEKs can still decrypt EDEKs");
-
-    // The user_dek we created earlier should still be decryptable
-    // even though we rotated KEKs
-    println!("[INFO] Attempting to decrypt EDEK created with old KEK version...");
+    let demo5_start = Instant::now();
     let _old_dek = service.decrypt_edek(
         &user_dek.dek_id,
         &user_dek.edek_blob,
         &test_user,
         user_dek.kek_version
     ).await?;
+    let demo5_duration = demo5_start.elapsed();
 
-    println!("[RESULT] ✓ Successfully decrypted with old KEK version: {}", user_dek.kek_version);
-    println!("[RESULT] ✓ Backward compatibility maintained");
+    println!("✓ Old KEK (v{}) can still decrypt EDEKs", user_dek.kek_version);
+    println!("[PERF] EDEK Decryption (old KEK): {:.3}ms ({:.2} ops/sec)\n",
+        demo5_duration.as_secs_f64() * 1000.0,
+        1.0 / demo5_duration.as_secs_f64());
 
     // ========================================================================
-    // Demo 6: Disable and Delete Old KEK
+    // Demo 6: KEK Lifecycle Management
     // ========================================================================
-    println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 6: KEK Lifecycle Management                                 │");
+    println!("┌{}┐", "─".repeat(68));
+    println!("│  Demo 6: KEK Lifecycle (Disable/Delete)                           │");
     println!("└{}┘", "─".repeat(68));
 
-    // Pick a user and try to manage their old KEK
-    let manage_user = user_ids[10];
-    println!("\n[INFO] Managing KEKs for user: {}", manage_user);
+    let manage_user_idx = std::cmp::min(10, test_quantity - 1);
+    let manage_user = user_ids[manage_user_idx];
 
-    // Try to disable the old KEK version (version 1 - now RETIRED after rotation)
-    println!("[INFO] Attempting to disable old RETIRED KEK (version 1)...");
+    let demo6_start = Instant::now();
     match service.disable_kek(&manage_user, 1).await {
         Ok(result) => {
+            let disable_time = demo6_start.elapsed().as_secs_f64() * 1000.0;
             if result {
-                println!("[RESULT] ✓ KEK disabled successfully");
+                println!("✓ KEK disabled");
+                println!("[PERF] Disable: {:.3}ms ({:.2} ops/sec)",
+                    disable_time, 1000.0 / disable_time);
 
-                // Now try to delete it
-                println!("\n[INFO] Attempting to delete disabled KEK...");
+                let delete_start = Instant::now();
                 match service.delete_kek(&manage_user, 1).await {
                     Ok(deleted) => {
+                        let delete_time = delete_start.elapsed().as_secs_f64() * 1000.0;
                         if deleted {
-                            println!("[RESULT] ✓ KEK deleted successfully");
+                            println!("✓ KEK deleted");
+                            println!("[PERF] Delete: {:.3}ms ({:.2} ops/sec)\n",
+                                delete_time, 1000.0 / delete_time);
                         }
                     }
-                    Err(e) => println!("[INFO] ⚠ Delete failed: {}", e),
+                    Err(e) => println!("[ERROR] Delete failed: {}\n", e),
                 }
             }
         }
-        Err(e) => println!("[INFO] ⚠ Disable failed: {}", e),
+        Err(e) => println!("[ERROR] Disable failed: {}\n", e),
     }
-
-    // ========================================================================
-    // Demo 7: Final Statistics
-    // ========================================================================
-    println!("\n┌{}┐", "─".repeat(68));
-    println!("│  Demo 7: Final Statistics                                         │");
-    println!("└{}┘", "─".repeat(68));
-
-    let final_stats = service.get_kek_stats().await?;
-
-    println!("\n[HSM-STYLE ARCHITECTURE]");
-    println!("  - Library manages: KEKs only");
-    println!("  - Application manages: DEKs and EDEKs");
-    println!("  - Purpose: Separation of concerns");
-
-    println!("\n[DATABASE]");
-    println!("  - KEK Statistics:");
-    for (status, count) in &final_stats {
-        println!("    - {}: {}", status, count);
-    }
-    println!("  - Storage: KEKs as plaintext (32 bytes)");
-    println!("  - Encryption at rest: Database encryption");
-
-    println!("\n[IMPORTANT]");
-    println!("  ⚠ Library does NOT cache or store DEKs");
-    println!("  ⚠ Application manages DEK lifecycle (cache, store as EDEK)");
-    println!("  ✓ Only KEKs persisted in database (encrypted at rest)");
-    println!("  ✓ Total users tested: {}", user_ids.len());
 
     // ========================================================================
     // Summary
     // ========================================================================
-    println!("\n{}", "=".repeat(70));
-    println!("                         SUMMARY");
+    println!("{}", "=".repeat(70));
+    println!("                    BENCHMARK SUMMARY");
     println!("{}\n", "=".repeat(70));
 
-    println!("┌─ Test Results ────────────────────────────────────────────────────┐");
+    let final_stats = service.get_kek_stats().await?;
+    println!("KEK Statistics:");
+    for (status, count) in &final_stats {
+        println!("  - {}: {}", status, count);
+    }
+
+    println!("\n┌─ Performance Summary (HSM-Style) ─────────────────────────────────┐");
     println!("│                                                                    │");
-    println!("│  ✓ Created 125 users with unique KEKs                             │");
-    println!("│  ✓ Bulk rotation: {} KEKs rotated in batches of 50          │", rotation_result.keks_rotated);
-    println!("│  ✓ Lazy rotation: Auto-triggered on access                        │");
-    println!("│  ✓ Backward compatibility: Old KEKs decrypt old EDEKs             │");
-    println!("│  ✓ KEK lifecycle: ACTIVE → RETIRED → DISABLED → Deleted           │");
-    println!("│  ✓ Performance: Batch processing with SKIP LOCKED                 │");
+    println!("│  KEK Creation:      {:.2} ops/sec{:>width$}│",
+        test_quantity as f64 / demo1_duration.as_secs_f64(), "",
+        width = 33 - format!("{:.2}", test_quantity as f64 / demo1_duration.as_secs_f64()).len());
+    println!("│  Encryption:        {:.2} ops/sec{:>width$}│",
+        1.0 / encrypt_time.as_secs_f64(), "",
+        width = 33 - format!("{:.2}", 1.0 / encrypt_time.as_secs_f64()).len());
+    println!("│  Decryption:        {:.2} ops/sec{:>width$}│",
+        1.0 / data_decrypt_time.as_secs_f64(), "",
+        width = 33 - format!("{:.2}", 1.0 / data_decrypt_time.as_secs_f64()).len());
+    println!("│  KEK Rotation:      {:.2} ops/sec{:>width$}│",
+        rotation_result.keks_rotated as f64 / demo3_duration.as_secs_f64(), "",
+        width = 33 - format!("{:.2}", rotation_result.keks_rotated as f64 / demo3_duration.as_secs_f64()).len());
     println!("│                                                                    │");
     println!("└────────────────────────────────────────────────────────────────────┘");
 
-    println!("\n✓ Database: Encrypts KEKs at rest");
-    println!("✓ KEKs: Per-user, 32 bytes plaintext in DB");
-    println!("✓ DEKs: In-memory only, never persisted");
-    println!("✓ Rotation:");
-    println!("  - Bulk: {} KEKs in batches of 50", rotation_result.keks_rotated);
-    println!("  - Lazy: Auto-rotate RETIRED KEKs on access");
-    println!("✓ Crypto: AES-256-GCM with AEAD format");
+    println!("\nTest Configuration:");
+    println!("  • Total users tested: {}", test_quantity);
+    println!("  • Crypto: AES-256-GCM with AEAD");
+    println!("  • KEK lifecycle: ACTIVE → RETIRED → DISABLED → Deleted");
+    println!("  • Rotation: Bulk (batches of 50) + Lazy (on-access)");
 
     println!("\n{}", "=".repeat(70));
-    println!("                      DEMO COMPLETE");
+    println!("                    BENCHMARK COMPLETE");
     println!("{}\n", "=".repeat(70));
 
     Ok(())

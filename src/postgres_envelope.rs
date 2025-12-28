@@ -33,11 +33,6 @@ pub struct PostgresEnvelopeService {
 impl PostgresEnvelopeService {
     /// Initialize service
     pub async fn new(storage: PostgresStorage) -> Result<Self> {
-        println!("[INIT] Initializing PostgresEnvelopeService...");
-        println!("[INIT] ✓ Database encryption handles KEKs at rest");
-        println!("[INIT] ✓ KEKs stored as plaintext (32 bytes) in database");
-        println!("[INIT] ✓ PostgresEnvelopeService initialized successfully\n");
-
         Ok(Self { storage })
     }
 
@@ -51,18 +46,12 @@ impl PostgresEnvelopeService {
     ///
     /// Note: Application is responsible for caching DEK or storing EDEK blob
     pub async fn generate_dek(&self, user_id: &Uuid) -> Result<GeneratedDek> {
-        println!("\n[GENERATE_DEK] Starting DEK generation for user: {}", user_id);
-
-        // Step 1: Get or create user's ACTIVE KEK from database
-        println!("[GENERATE_DEK] Step 1: Fetching/creating user KEK from database...");
+        // Get or create user's ACTIVE KEK from database
         let kek_info = self.get_or_create_user_kek(user_id).await?;
-        println!("[GENERATE_DEK] ✓ KEK retrieved (version: {}, status: {:?})", kek_info.version, kek_info.status);
 
         // If KEK is RETIRED, perform lazy rotation
         if kek_info.status == KekStatus::Retired {
-            println!("[GENERATE_DEK] ⚠ KEK is RETIRED, performing lazy rotation...");
             let rotated_kek = self.rotate_single_kek(user_id, kek_info.version).await?;
-            println!("[GENERATE_DEK] ✓ Lazy rotation complete, using new ACTIVE KEK (version: {})", rotated_kek.version);
             return self.generate_dek_with_kek(user_id, rotated_kek).await;
         }
 
@@ -71,21 +60,15 @@ impl PostgresEnvelopeService {
 
     /// Internal: Generate DEK with a specific KEK
     async fn generate_dek_with_kek(&self, _user_id: &Uuid, kek_info: KekInfo) -> Result<GeneratedDek> {
-        // Step 2: Generate fresh DEK (random 32 bytes, ephemeral)
-        println!("[GENERATE_DEK] Step 2: Generating fresh DEK (32 bytes, ephemeral)...");
+        // Generate fresh DEK (random 32 bytes, ephemeral)
         let dek = SecureKey::generate();
         let dek_id = Uuid::new_v4();
-        println!("[GENERATE_DEK] ✓ DEK generated (ID: {})", dek_id);
-        println!("[GENERATE_DEK] ⚠ DEK management is application's responsibility");
 
-        // Step 3: Encrypt DEK with user's KEK (AAD = dek_id for binding)
-        println!("[GENERATE_DEK] Step 3: Encrypting DEK with KEK (AAD=dek_id)...");
+        // Encrypt DEK with user's KEK (AAD = dek_id for binding)
         let edek = AesGcmCipher::encrypt(&kek_info.kek, dek.as_bytes(), Some(dek_id.as_bytes()))?;
 
         // Convert to AEAD blob format (nonce || ciphertext || tag)
         let edek_blob = edek.to_aead_blob();
-        println!("[GENERATE_DEK] ✓ EDEK created (AEAD blob: {} bytes)", edek_blob.len());
-        println!("[GENERATE_DEK] ✓ DEK generation complete\n");
 
         Ok(GeneratedDek {
             dek_id,
@@ -114,31 +97,12 @@ impl PostgresEnvelopeService {
         user_id: &Uuid,
         kek_version: i64,
     ) -> Result<SecureKey> {
-        println!("\n[DECRYPT_EDEK] Starting EDEK decryption (DEK ID: {})", dek_id);
-        println!("[DECRYPT_EDEK] User: {}", user_id);
-        println!("[DECRYPT_EDEK] KEK version: {}", kek_version);
-        println!("[DECRYPT_EDEK] EDEK blob: {} bytes", edek_blob.len());
-
-        // Step 1: Get user's KEK for this version
-        println!("[DECRYPT_EDEK] Step 1: Fetching KEK from database (version: {})...", kek_version);
+        // Get user's KEK for this version
         let kek_info = self.get_kek_by_version(user_id, kek_version).await?;
-        println!("[DECRYPT_EDEK] ✓ KEK retrieved (status: {:?})", kek_info.status);
 
-        // Step 2: Decrypt EDEK using the ORIGINAL KEK (CRITICAL: must use same KEK that encrypted it)
-        println!("[DECRYPT_EDEK] Step 2: Decrypting EDEK with KEK version {} (AAD=dek_id)...", kek_version);
+        // Decrypt EDEK using the ORIGINAL KEK (CRITICAL: must use same KEK that encrypted it)
         let edek = EncryptedData::from_aead_blob(edek_blob)?;
         let dek_bytes = AesGcmCipher::decrypt(&kek_info.kek, &edek, Some(dek_id.as_bytes()))?;
-        println!("[DECRYPT_EDEK] ✓ DEK decrypted successfully (32 bytes)");
-        println!("[DECRYPT_EDEK] ⚠ DEK management is application's responsibility");
-
-        // Step 3: If KEK is RETIRED, log intent for lazy rotation (after successful decryption)
-        if kek_info.status == KekStatus::Retired {
-            println!("[DECRYPT_EDEK] ⚠ KEK is RETIRED (lazy rotation recommended)");
-            println!("[DECRYPT_EDEK] ℹ Note: Application should re-encrypt DEK with new ACTIVE KEK");
-            println!("[DECRYPT_EDEK] ℹ Note: Call generate_dek() to get new EDEK with latest KEK");
-        }
-
-        println!("[DECRYPT_EDEK] ✓ EDEK decryption complete\n");
 
         Ok(SecureKey::new(dek_bytes))
     }
@@ -152,41 +116,30 @@ impl PostgresEnvelopeService {
     ///
     /// Returns: (total_keks_marked_retired, total_keks_rotated)
     pub async fn bulk_rotate_all_keks(&self) -> Result<BulkRotationResult> {
-        println!("\n[BULK_ROTATE] Starting bulk KEK rotation");
-
-        // Step 1: Mark all ACTIVE KEKs as RETIRED
-        println!("[BULK_ROTATE] Step 1: Marking all ACTIVE KEKs as RETIRED...");
+        // Mark all ACTIVE KEKs as RETIRED
         let marked_count = self.storage.mark_all_active_keks_as_retired().await?;
-        println!("[BULK_ROTATE] ✓ Marked {} KEKs as RETIRED", marked_count);
 
         if marked_count == 0 {
-            println!("[BULK_ROTATE] ⚠ No KEKs to rotate");
             return Ok(BulkRotationResult {
                 keks_marked_retired: 0,
                 keks_rotated: 0,
             });
         }
 
-        // Step 2: Rotate in batches of 50
-        println!("[BULK_ROTATE] Step 2: Rotating KEKs in batches of 50...");
+        // Rotate in batches of 50
         let mut total_rotated = 0i64;
         let batch_size = 50;
         let mut iteration = 0;
 
         loop {
             iteration += 1;
-            println!("[BULK_ROTATE] Fetching batch {}...", iteration);
 
             let batch = self.storage.get_retired_keks_batch(batch_size).await?;
             if batch.is_empty() {
-                println!("[BULK_ROTATE] ✓ No more RETIRED KEKs to rotate");
                 break;
             }
 
-            let batch_len = batch.len();
-            println!("[BULK_ROTATE] Processing batch {} with {} RETIRED KEKs...", iteration, batch_len);
-
-            for (idx, stored_kek) in batch.iter().enumerate() {
+            for stored_kek in batch.iter() {
                 // Generate new KEK (32 bytes)
                 let new_kek_bytes = generate_random_bytes(32);
 
@@ -198,22 +151,14 @@ impl PostgresEnvelopeService {
                 ).await?;
 
                 total_rotated += 1;
-
-                if (idx + 1) % 10 == 0 || idx + 1 == batch_len {
-                    println!("[BULK_ROTATE]   ✓ Rotated {}/{} KEKs in batch {}", idx + 1, batch_len, iteration);
-                }
             }
 
             // Safety check: prevent infinite loop
             if iteration > 10 {
-                println!("[BULK_ROTATE] ⚠ Safety limit reached (10 iterations), stopping");
-                println!("[BULK_ROTATE] ⚠ This may indicate an issue with rotation logic");
+                eprintln!("[ERROR] Bulk rotation safety limit reached (10 iterations)");
                 break;
             }
         }
-
-        println!("[BULK_ROTATE] ✓ Bulk rotation complete");
-        println!("[BULK_ROTATE] ✓ Marked: {}, Rotated: {}\n", marked_count, total_rotated);
 
         Ok(BulkRotationResult {
             keks_marked_retired: marked_count,
@@ -231,16 +176,11 @@ impl PostgresEnvelopeService {
     ///
     /// Returns: Result with the new KEK version number
     pub async fn rotate_user_kek(&self, user_id: &Uuid) -> Result<UserKekRotationResult> {
-        println!("[ROTATE_USER_KEK] Starting KEK rotation for user: {}", user_id);
-
         // Get the current ACTIVE KEK
         let active_kek = self.storage.get_active_kek(user_id).await?;
 
         let old_version = match active_kek {
-            Some(kek) => {
-                println!("[ROTATE_USER_KEK] Found ACTIVE KEK (version: {})", kek.version);
-                kek.version
-            }
+            Some(kek) => kek.version,
             None => {
                 return Err(EnvelopeError::KeyNotFound(format!(
                     "No ACTIVE KEK found for user: {}. Generate a KEK first by calling generate_dek().",
@@ -251,8 +191,6 @@ impl PostgresEnvelopeService {
 
         // Rotate the KEK
         let rotated_kek = self.rotate_single_kek(user_id, old_version).await?;
-
-        println!("[ROTATE_USER_KEK] ✓ KEK rotation complete (v{} → v{})", old_version, rotated_kek.version);
 
         Ok(UserKekRotationResult {
             user_id: *user_id,
@@ -266,14 +204,7 @@ impl PostgresEnvelopeService {
     /// Changes KEK status to DISABLED. Only RETIRED KEKs can be disabled.
     /// Returns true if status changed, false if already disabled.
     pub async fn disable_kek(&self, user_id: &Uuid, version: i64) -> Result<bool> {
-        println!("\n[DISABLE_KEK] Disabling KEK (user: {}, version: {})", user_id, version);
-        let result = self.storage.disable_kek(user_id, version).await?;
-        if result {
-            println!("[DISABLE_KEK] ✓ KEK disabled successfully\n");
-        } else {
-            println!("[DISABLE_KEK] ⚠ KEK was already disabled\n");
-        }
-        Ok(result)
+        self.storage.disable_kek(user_id, version).await
     }
 
     /// API: delete_kek(user_id, version) - Delete a KEK
@@ -281,14 +212,7 @@ impl PostgresEnvelopeService {
     /// Only deletes if status is DISABLED. Otherwise raises exception.
     /// Returns true if deleted, false if not found.
     pub async fn delete_kek(&self, user_id: &Uuid, version: i64) -> Result<bool> {
-        println!("\n[DELETE_KEK] Deleting KEK (user: {}, version: {})", user_id, version);
-        let result = self.storage.delete_kek(user_id, version).await?;
-        if result {
-            println!("[DELETE_KEK] ✓ KEK deleted successfully\n");
-        } else {
-            println!("[DELETE_KEK] ⚠ KEK not found\n");
-        }
-        Ok(result)
+        self.storage.delete_kek(user_id, version).await
     }
 
     /// API: get_kek_stats() - Get KEK statistics by status
@@ -298,16 +222,8 @@ impl PostgresEnvelopeService {
 
     /// Internal: Get or create user's ACTIVE KEK
     async fn get_or_create_user_kek(&self, user_id: &Uuid) -> Result<KekInfo> {
-        println!("[GET_OR_CREATE_KEK] Checking database for existing KEK (user: {})...", user_id);
-
         // Try to get existing active KEK
         if let Some(stored_kek) = self.storage.get_active_kek(user_id).await? {
-            println!("[GET_OR_CREATE_KEK] ✓ Found existing KEK in database");
-            println!("[GET_OR_CREATE_KEK]   - KEK version: {}", stored_kek.version);
-            println!("[GET_OR_CREATE_KEK]   - KEK status: {:?}", stored_kek.status);
-            println!("[GET_OR_CREATE_KEK]   - KEK plaintext: {} bytes", stored_kek.kek_plaintext.len());
-            println!("[GET_OR_CREATE_KEK] ⚠ KEK stored as plaintext, encrypted at rest by database");
-
             let kek = SecureKey::new(stored_kek.kek_plaintext);
 
             return Ok(KekInfo {
@@ -318,14 +234,10 @@ impl PostgresEnvelopeService {
         }
 
         // Create new KEK for user
-        println!("[GET_OR_CREATE_KEK] ✗ No existing KEK found, creating new one...");
-        println!("[GET_OR_CREATE_KEK] Generating new KEK (32 bytes)...");
         let kek = SecureKey::generate();
         let version = 1;
-        println!("[GET_OR_CREATE_KEK] ✓ KEK generated (version: {})", version);
 
         // Store KEK in database (plaintext, database encrypts at rest)
-        println!("[GET_OR_CREATE_KEK] Storing KEK in database...");
         let stored_kek = StoredKek {
             user_id: *user_id,
             version,
@@ -337,8 +249,6 @@ impl PostgresEnvelopeService {
         };
 
         self.storage.store_kek(&stored_kek).await?;
-        println!("[GET_OR_CREATE_KEK] ✓ KEK stored in database (user_keks table)");
-        println!("[GET_OR_CREATE_KEK] ⚠ KEK stored as plaintext, encrypted at rest by database");
 
         Ok(KekInfo {
             version,
@@ -368,15 +278,12 @@ impl PostgresEnvelopeService {
 
     /// Internal: Rotate single KEK (lazy rotation)
     async fn rotate_single_kek(&self, user_id: &Uuid, old_version: i64) -> Result<KekInfo> {
-        println!("[ROTATE_KEK] Rotating single KEK (user: {}, old_version: {})", user_id, old_version);
-
         // Generate new KEK
         let new_kek_bytes = generate_random_bytes(32);
         let new_kek = SecureKey::new(new_kek_bytes.clone());
 
         // Call SQL function to rotate
         let new_version = self.storage.rotate_kek(user_id, old_version, &new_kek_bytes).await?;
-        println!("[ROTATE_KEK] ✓ KEK rotated (v{} → v{})", old_version, new_version);
 
         Ok(KekInfo {
             version: new_version,
