@@ -220,6 +220,37 @@ impl PostgresEnvelopeService {
         self.storage.get_kek_stats().await
     }
 
+    /// API: get_active_kek_raw(user_id) -> Option<(kek_bytes, version)>
+    ///
+    /// Get user's active KEK as raw bytes for caching purposes
+    /// Returns None if no active KEK exists
+    pub async fn get_active_kek_raw(&self, user_id: &Uuid) -> Result<Option<(Vec<u8>, i64)>> {
+        if let Some(stored_kek) = self.storage.get_active_kek(user_id).await? {
+            Ok(Some((stored_kek.kek_plaintext, stored_kek.version)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// API: create_kek_for_user(user_id, kek_bytes) -> version
+    ///
+    /// Create a new active KEK for user with provided bytes
+    /// Used when application wants to provide its own KEK material
+    pub async fn create_kek_for_user(&self, user_id: &Uuid, kek_bytes: &[u8; 32]) -> Result<i64> {
+        let stored_kek = StoredKek {
+            user_id: *user_id,
+            version: 1,
+            kek_plaintext: kek_bytes.to_vec(),
+            status: KekStatus::Active,
+            created_at: Utc::now(),
+            last_accessed_at: None,
+            last_rotated_at: None,
+        };
+
+        self.storage.store_kek(&stored_kek).await?;
+        Ok(1)
+    }
+
     /// Internal: Get or create user's ACTIVE KEK
     async fn get_or_create_user_kek(&self, user_id: &Uuid) -> Result<KekInfo> {
         // Try to get existing active KEK
