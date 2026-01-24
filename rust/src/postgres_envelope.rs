@@ -130,6 +130,8 @@ impl PostgresEnvelopeService {
         let mut total_rotated = 0i64;
         let batch_size = 50;
         let mut iteration = 0;
+        // Calculate max iterations based on marked count (with buffer)
+        let max_iterations = (marked_count / batch_size as i64) + 10;
 
         loop {
             iteration += 1;
@@ -153,9 +155,9 @@ impl PostgresEnvelopeService {
                 total_rotated += 1;
             }
 
-            // Safety check: prevent infinite loop
-            if iteration > 10 {
-                eprintln!("[ERROR] Bulk rotation safety limit reached (10 iterations)");
+            // Safety check: prevent infinite loop (should never hit with fixed SQL)
+            if iteration > max_iterations {
+                eprintln!("[ERROR] Bulk rotation safety limit reached ({} iterations)", max_iterations);
                 break;
             }
         }

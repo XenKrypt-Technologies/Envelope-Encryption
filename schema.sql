@@ -247,7 +247,8 @@ COMMENT ON FUNCTION mark_all_active_keks_as_retired IS
 
 -- Function: Get batch of RETIRED KEKs for rotation
 -- IMPORTANT: Only returns the LATEST (max version) RETIRED KEK per user
--- This prevents conflicts when rotating (only one ACTIVE KEK per user)
+-- AND only for users who don't already have an ACTIVE KEK (need rotation)
+-- This prevents infinite loops when rotating
 CREATE OR REPLACE FUNCTION get_retired_keks_batch(p_batch_size INTEGER DEFAULT 50)
 RETURNS TABLE (
     user_id UUID,
@@ -264,6 +265,12 @@ RETURNS TABLE (
             MAX(user_keks.kek_version) as max_version
         FROM user_keks
         WHERE user_keks.status = 'RETIRED'
+        -- Only include users who don't have an ACTIVE KEK (need rotation)
+        AND NOT EXISTS (
+            SELECT 1 FROM user_keks active
+            WHERE active.user_id = user_keks.user_id
+            AND active.status = 'ACTIVE'
+        )
         GROUP BY user_keks.user_id
     )
     SELECT k.user_id, k.kek_version, k.kek_plaintext, k.status, k.created_at, k.last_accessed_at, k.last_rotated_at

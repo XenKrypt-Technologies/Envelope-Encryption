@@ -1,6 +1,25 @@
-# Build artifacts
-/target
-Cargo.lock
+# Rust build artifacts
+rust/target/
+rust/Cargo.lock
+
+# Python
+python/venv/
+python/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Environment variables
 .env
