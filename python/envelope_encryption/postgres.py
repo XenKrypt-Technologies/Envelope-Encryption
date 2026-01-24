@@ -1,20 +1,24 @@
 """
-PostgreSQL-based envelope encryption service.
+PostgreSQL-based envelope encryption.
 
 This module provides:
-- PostgresEnvelopeService: Main API for envelope encryption with PostgreSQL backend
+- PostgresStorage: PostgreSQL storage backend for KEKs
+- PostgresEnvelopeService: Main API for envelope encryption
+- StoredKek: KEK stored in database (encrypted at rest by database)
+- StoredDek: DEK metadata (EDEK stored with application data)
+- KekStatus: KEK lifecycle status enum
 - GeneratedDek: Result of DEK generation
 - BulkRotationResult: Result of bulk KEK rotation
 - UserKekRotationResult: Result of single user KEK rotation
 
 Architecture:
-- **Database**: Stores KEKs as plaintext (32 bytes, encrypted at rest by database encryption)
+- **Database**: Stores KEKs as plaintext (32 bytes, encrypted at rest by database)
 - **Memory**: DEKs generated on-demand, never persisted to database
 
 Key hierarchy:
-- Database Encryption → KEK (plaintext in DB, encrypted at rest by database)
-- KEK → DEK (ephemeral, managed by application)
-- DEK → Application Data
+- Database Encryption -> KEK (plaintext in DB, encrypted at rest by database)
+- KEK -> DEK (ephemeral, managed by application)
+- DEK -> Application Data
 
 HSM-style design:
 - Library manages KEK lifecycle (create, rotate, disable, delete)
@@ -32,12 +36,76 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import List, Optional, Tuple
 from uuid import UUID, uuid4
 
+import asyncpg
+
 from .crypto import AesGcmCipher, EncryptedData, SecureKey, generate_random_bytes
-from .errors import KeyNotFoundError
-from .postgres_storage import KekStatus, PostgresStorage, StoredKek
+from .errors import KeyNotFoundError, StorageError
+
+
+# =============================================================================
+# KEK Status Enum
+# =============================================================================
+
+
+class KekStatus(Enum):
+    """KEK lifecycle status (matches database ENUM)."""
+
+    ACTIVE = "ACTIVE"  # Current KEK for user (encrypt + decrypt)
+    RETIRED = "RETIRED"  # Old KEK version (decrypt only, pending rotation)
+    DISABLED = "DISABLED"  # Marked for deletion (no active EDEKs)
+
+    def __str__(self) -> str:
+        return self.value
+
+    @classmethod
+    def from_str(cls, s: str) -> KekStatus:
+        """Parse from string."""
+        try:
+            return cls(s.upper())
+        except ValueError:
+            raise StorageError(f"Invalid KEK status: {s}")
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+
+@dataclass
+class StoredKek:
+    """
+    Stored KEK (database encrypted at rest).
+
+    KEK stored as plaintext (32 bytes), encrypted at rest by database encryption.
+    """
+
+    user_id: UUID
+    version: int
+    kek_plaintext: bytes  # KEK as plaintext (32 bytes), database encrypts at rest
+    status: KekStatus
+    created_at: datetime
+    last_accessed_at: Optional[datetime] = None
+    last_rotated_at: Optional[datetime] = None
+
+
+@dataclass
+class StoredDek:
+    """
+    Stored DEK metadata (EDEK = Encrypted DEK by KEK).
+
+    Production AEAD format: edek_blob = nonce || ciphertext || tag (60 bytes total)
+    """
+
+    dek_id: UUID
+    user_id: UUID
+    kek_version: int
+    edek_blob: bytes  # AEAD format: nonce(12) || ciphertext(32) || tag(16) = 60 bytes
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
 
 
 @dataclass
@@ -76,6 +144,237 @@ class _KekInfo:
     status: KekStatus
 
 
+# =============================================================================
+# PostgreSQL Storage
+# =============================================================================
+
+
+class PostgresStorage:
+    """
+    PostgreSQL storage backend for KEKs.
+
+    Stores KEKs as plaintext (encrypted at rest by database encryption).
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        """
+        Initialize PostgreSQL storage.
+
+        Args:
+            pool: asyncpg connection pool
+        """
+        self._pool = pool
+
+    @property
+    def pool(self) -> asyncpg.Pool:
+        """Get the connection pool."""
+        return self._pool
+
+    async def get_active_kek(self, user_id: UUID) -> Optional[StoredKek]:
+        """
+        Get active KEK for a user (calls SQL function).
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            StoredKek if found, None otherwise
+        """
+        query = """
+            SELECT user_id, kek_version, kek_plaintext, status::TEXT as status,
+                   created_at, last_accessed_at, last_rotated_at
+            FROM get_active_kek($1)
+        """
+        try:
+            row = await self._pool.fetchrow(query, user_id)
+            if row is None:
+                return None
+            return self._row_to_stored_kek(row)
+        except Exception as e:
+            raise StorageError(f"Failed to get active KEK: {e}")
+
+    async def get_kek_by_version(
+        self, user_id: UUID, version: int
+    ) -> Optional[StoredKek]:
+        """
+        Get KEK by version (calls SQL function).
+
+        Args:
+            user_id: User UUID
+            version: KEK version number
+
+        Returns:
+            StoredKek if found, None otherwise
+        """
+        query = """
+            SELECT user_id, kek_version, kek_plaintext, status::TEXT as status,
+                   created_at, last_accessed_at, last_rotated_at
+            FROM get_kek_by_version($1, $2)
+        """
+        try:
+            row = await self._pool.fetchrow(query, user_id, version)
+            if row is None:
+                return None
+            return self._row_to_stored_kek(row)
+        except Exception as e:
+            raise StorageError(f"Failed to get KEK by version: {e}")
+
+    async def store_kek(self, kek: StoredKek) -> None:
+        """
+        Store a new KEK (plaintext, will be encrypted at rest by database).
+
+        Args:
+            kek: StoredKek to store
+        """
+        query = """
+            INSERT INTO user_keks (user_id, kek_version, kek_plaintext, status, created_at)
+            VALUES ($1, $2, $3, $4::key_status, $5)
+        """
+        try:
+            await self._pool.execute(
+                query,
+                kek.user_id,
+                kek.version,
+                kek.kek_plaintext,
+                kek.status.value,
+                kek.created_at,
+            )
+        except Exception as e:
+            raise StorageError(f"Failed to store KEK: {e}")
+
+    async def disable_kek(self, user_id: UUID, version: int) -> bool:
+        """
+        Disable KEK (calls SQL function).
+
+        Changes status to DISABLED. Only RETIRED KEKs can be disabled.
+
+        Args:
+            user_id: User UUID
+            version: KEK version number
+
+        Returns:
+            True if status changed, False if already disabled
+        """
+        query = "SELECT disable_kek($1, $2) as result"
+        try:
+            row = await self._pool.fetchrow(query, user_id, version)
+            return row["result"] if row else False
+        except Exception as e:
+            raise StorageError(f"Failed to disable KEK: {e}")
+
+    async def delete_kek(self, user_id: UUID, version: int) -> bool:
+        """
+        Delete KEK (calls SQL function).
+
+        Only deletes if status is DISABLED, otherwise raises exception.
+
+        Args:
+            user_id: User UUID
+            version: KEK version number
+
+        Returns:
+            True if deleted, False if not found
+        """
+        query = "SELECT delete_kek($1, $2) as result"
+        try:
+            row = await self._pool.fetchrow(query, user_id, version)
+            return row["result"] if row else False
+        except Exception as e:
+            raise StorageError(f"Failed to delete KEK: {e}")
+
+    async def mark_all_active_keks_as_retired(self) -> int:
+        """
+        Mark all ACTIVE KEKs as RETIRED (first step of bulk rotation).
+
+        Returns:
+            Count of KEKs marked as RETIRED
+        """
+        query = "SELECT mark_all_active_keks_as_retired() as count"
+        try:
+            row = await self._pool.fetchrow(query)
+            return row["count"] if row else 0
+        except Exception as e:
+            raise StorageError(f"Failed to mark KEKs as retired: {e}")
+
+    async def get_retired_keks_batch(self, batch_size: int = 50) -> List[StoredKek]:
+        """
+        Get batch of RETIRED KEKs for rotation (calls SQL function).
+
+        Uses SKIP LOCKED for concurrent rotation workers.
+
+        Args:
+            batch_size: Maximum number of KEKs to return (default: 50)
+
+        Returns:
+            List of StoredKek for rotation
+        """
+        query = """
+            SELECT user_id, kek_version, kek_plaintext, status::TEXT as status,
+                   created_at, last_accessed_at, last_rotated_at
+            FROM get_retired_keks_batch($1)
+        """
+        try:
+            rows = await self._pool.fetch(query, batch_size)
+            return [self._row_to_stored_kek(row) for row in rows]
+        except Exception as e:
+            raise StorageError(f"Failed to get retired KEKs batch: {e}")
+
+    async def rotate_kek(
+        self, user_id: UUID, old_version: int, new_kek: bytes
+    ) -> int:
+        """
+        Rotate single KEK (calls SQL function).
+
+        Marks old KEK as RETIRED, creates new ACTIVE KEK.
+
+        Args:
+            user_id: User UUID
+            old_version: Current KEK version to rotate from
+            new_kek: New KEK bytes (32 bytes)
+
+        Returns:
+            New version number
+        """
+        query = "SELECT rotate_kek($1, $2, $3) as new_version"
+        try:
+            row = await self._pool.fetchrow(query, user_id, old_version, new_kek)
+            return row["new_version"] if row else 0
+        except Exception as e:
+            raise StorageError(f"Failed to rotate KEK: {e}")
+
+    async def get_kek_stats(self) -> List[Tuple[str, int]]:
+        """
+        Get KEK statistics (calls SQL function).
+
+        Returns:
+            List of (status, count) tuples
+        """
+        query = "SELECT status::TEXT, count FROM get_kek_stats()"
+        try:
+            rows = await self._pool.fetch(query)
+            return [(row["status"], row["count"]) for row in rows]
+        except Exception as e:
+            raise StorageError(f"Failed to get KEK stats: {e}")
+
+    @staticmethod
+    def _row_to_stored_kek(row: asyncpg.Record) -> StoredKek:
+        """Convert database row to StoredKek."""
+        return StoredKek(
+            user_id=row["user_id"],
+            version=row["kek_version"],
+            kek_plaintext=bytes(row["kek_plaintext"]),
+            status=KekStatus.from_str(row["status"]),
+            created_at=row["created_at"],
+            last_accessed_at=row["last_accessed_at"],
+            last_rotated_at=row["last_rotated_at"],
+        )
+
+
+# =============================================================================
+# Envelope Service
+# =============================================================================
+
+
 class PostgresEnvelopeService:
     """
     PostgreSQL-based envelope encryption service.
@@ -110,9 +409,9 @@ class PostgresEnvelopeService:
         Generate a new DEK for a user.
 
         Crypto flow:
-        1. Get or create ACTIVE KEK for user (plaintext from DB, encrypted at rest by database)
+        1. Get or create ACTIVE KEK for user (plaintext from DB)
         2. Generate fresh DEK (random 32 bytes, ephemeral)
-        3. Encrypt DEK using KEK with AES-GCM (AAD = dek_id) → EDEK
+        3. Encrypt DEK using KEK with AES-GCM (AAD = dek_id) -> EDEK
         4. Return (dek_id, dek, edek_blob, kek_version)
 
         Note: Application is responsible for caching DEK or storing EDEK blob
@@ -166,7 +465,7 @@ class PostgresEnvelopeService:
 
         Crypto flow:
         1. Fetch KEK from database by (user_id, kek_version)
-        2. Decrypt EDEK using the ORIGINAL KEK (AAD = dek_id) → DEK
+        2. Decrypt EDEK using the ORIGINAL KEK (AAD = dek_id) -> DEK
         3. Return DEK
 
         IMPORTANT: Must use the SAME KEK version that was used for encryption.
@@ -183,7 +482,7 @@ class PostgresEnvelopeService:
         # Get user's KEK for this version
         kek_info = await self._get_kek_by_version(user_id, kek_version)
 
-        # Decrypt EDEK using the ORIGINAL KEK (CRITICAL: must use same KEK that encrypted it)
+        # Decrypt EDEK using the ORIGINAL KEK
         edek = EncryptedData.from_aead_blob(edek_blob)
         dek_bytes = AesGcmCipher.decrypt(kek_info.kek, edek, dek_id.bytes)
 
@@ -211,7 +510,6 @@ class PostgresEnvelopeService:
         total_rotated = 0
         batch_size = 50
         iteration = 0
-        # Calculate max iterations based on marked count (with buffer)
         max_iterations = (marked_count // batch_size) + 10
 
         while True:
@@ -222,19 +520,14 @@ class PostgresEnvelopeService:
                 break
 
             for stored_kek in batch:
-                # Generate new KEK (32 bytes)
                 new_kek_bytes = generate_random_bytes(32)
-
-                # Rotate KEK
                 await self._storage.rotate_kek(
                     stored_kek.user_id,
                     stored_kek.version,
                     new_kek_bytes,
                 )
-
                 total_rotated += 1
 
-            # Safety check: prevent infinite loop (should never hit with fixed SQL)
             if iteration > max_iterations:
                 print(f"[ERROR] Bulk rotation safety limit reached ({max_iterations} iterations)")
                 break
@@ -248,12 +541,6 @@ class PostgresEnvelopeService:
         """
         Rotate a specific user's ACTIVE KEK on demand.
 
-        This function allows you to rotate a specific user's KEK without doing bulk rotation.
-        It will:
-        1. Get the user's current ACTIVE KEK
-        2. Mark it as RETIRED
-        3. Generate a new ACTIVE KEK for the user
-
         Args:
             user_id: User UUID
 
@@ -263,7 +550,6 @@ class PostgresEnvelopeService:
         Raises:
             KeyNotFoundError: If no ACTIVE KEK exists for user
         """
-        # Get the current ACTIVE KEK
         active_kek = await self._storage.get_active_kek(user_id)
 
         if active_kek is None:
@@ -273,8 +559,6 @@ class PostgresEnvelopeService:
             )
 
         old_version = active_kek.version
-
-        # Rotate the KEK
         rotated_kek = await self._rotate_single_kek(user_id, old_version)
 
         return UserKekRotationResult(
@@ -371,7 +655,6 @@ class PostgresEnvelopeService:
 
     async def _get_or_create_user_kek(self, user_id: UUID) -> _KekInfo:
         """Internal: Get or create user's ACTIVE KEK."""
-        # Try to get existing active KEK
         stored_kek = await self._storage.get_active_kek(user_id)
         if stored_kek:
             kek = SecureKey(stored_kek.kek_plaintext)
@@ -381,11 +664,9 @@ class PostgresEnvelopeService:
                 status=stored_kek.status,
             )
 
-        # Create new KEK for user
         kek = SecureKey.generate()
         version = 1
 
-        # Store KEK in database (plaintext, database encrypts at rest)
         new_kek = StoredKek(
             user_id=user_id,
             version=version,
@@ -415,11 +696,9 @@ class PostgresEnvelopeService:
 
     async def _rotate_single_kek(self, user_id: UUID, old_version: int) -> _KekInfo:
         """Internal: Rotate single KEK (lazy rotation)."""
-        # Generate new KEK
         new_kek_bytes = generate_random_bytes(32)
         new_kek = SecureKey(new_kek_bytes)
 
-        # Call SQL function to rotate
         new_version = await self._storage.rotate_kek(
             user_id, old_version, new_kek_bytes
         )

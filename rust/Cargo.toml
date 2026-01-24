@@ -2,7 +2,7 @@
 name = "envelope-encryption"
 version = "0.1.0"
 edition = "2021"
-description = "Envelope encryption with AES-256-GCM"
+description = "Envelope encryption with AES-256-GCM and PostgreSQL storage"
 license = "MIT"
 
 [lib]
@@ -16,6 +16,7 @@ path = "src/main.rs"
 [features]
 default = ["postgres"]
 postgres = []
+benchmark = []
 
 [dependencies]
 aes-gcm = "0.10"

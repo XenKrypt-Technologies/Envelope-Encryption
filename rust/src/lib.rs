@@ -160,9 +160,6 @@
 
 pub mod crypto;
 pub mod error;
-pub mod storage;
-pub mod key_manager;
-pub mod envelope;
 
 // PostgreSQL backend modules
 pub mod postgres_storage;
@@ -198,57 +195,6 @@ pub use error::EnvelopeError;
 
 /// Result type alias using [`EnvelopeError`].
 pub use error::Result;
-
-// ============================================================================
-// Legacy Storage Exports (In-Memory)
-// ============================================================================
-
-/// Storage trait for key management backends.
-pub use storage::KeyStorage;
-
-/// In-memory storage implementation for testing.
-pub use storage::InMemoryStorage;
-
-/// Metadata for stored keys.
-pub use storage::KeyMetadata;
-
-/// Key type enumeration.
-pub use storage::KeyType;
-
-/// Stored key with metadata.
-pub use storage::StoredKey;
-
-/// Encrypted record wrapper.
-pub use storage::EncryptedRecord;
-
-// ============================================================================
-// Legacy Key Manager Exports
-// ============================================================================
-
-/// Key manager for server key and KEK/DEK operations.
-pub use key_manager::KeyManager;
-
-/// DEK information returned by key manager.
-pub use key_manager::DekInfo;
-
-/// User KEK information.
-pub use key_manager::UserKekInfo;
-
-/// Key rotation result.
-pub use key_manager::RotationResult;
-
-/// Key statistics.
-pub use key_manager::KeyStats;
-
-// ============================================================================
-// Legacy Envelope Exports
-// ============================================================================
-
-/// Legacy envelope encryption service (in-memory).
-pub use envelope::EnvelopeEncryption;
-
-/// Encrypted envelope structure.
-pub use envelope::EncryptedEnvelope;
 
 // ============================================================================
 // PostgreSQL Exports (Primary API)
